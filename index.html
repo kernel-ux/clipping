@@ -37,7 +37,7 @@
           <h1 class="truncate text-sm font-bold tracking-tight text-white">Stickman Studio</h1>
           <p class="hidden sm:flex items-center gap-1 text-[11px] text-zinc-400">
             <i data-lucide="shield-check" class="h-3 w-3 text-emerald-400"></i>
-            100% In-Browser · Single File · Zero API Keys
+            Browser-local · Narration Studio · No API Keys
           </p>
         </div>
       </div>
@@ -161,8 +161,8 @@
                 class="rounded-md border border-zinc-700 bg-zinc-900 px-2 py-1 text-[11px] text-zinc-300 focus:border-yellow-400 focus:outline-none"
                 title="In-browser Whisper model; downloaded once when browser storage is available"
               >
-                <option value="onnx-community/whisper-tiny.en" selected>Whisper Tiny.en · Fastest (~40MB)</option>
-                <option value="onnx-community/whisper-base.en">Whisper Base.en · Slower, more capable (~75MB)</option>
+                <option value="Xenova/whisper-tiny.en" selected>Whisper Tiny.en · Fastest (~40MB)</option>
+                <option value="Xenova/whisper-base.en">Whisper Base.en · Slower, more capable (~75MB)</option>
               </select>
             </div>
 
@@ -325,7 +325,23 @@
             >
               <i data-lucide="image-plus" class="mx-auto mb-1.5 h-5 w-5 text-zinc-500"></i>
               <p class="text-xs font-medium text-zinc-300">Drop or click to select PNG, JPG, or WebP images</p>
-              <p class="mt-0.5 text-[11px] text-zinc-500">Images are kept intact · Drag cards or use arrows to reorder</p>
+              <p class="mt-0.5 text-[11px] text-zinc-500">Drag cards or use arrows to reorder</p>
+            </div>
+
+            <div class="rounded-xl border border-zinc-800 bg-[#18181c] p-3 space-y-2">
+              <div class="flex items-center justify-between gap-2">
+                <label for="autoGeminiCleanupToggle" class="flex items-center gap-2 text-xs font-semibold text-zinc-200">
+                  <input id="autoGeminiCleanupToggle" type="checkbox" checked class="h-4 w-4 rounded border-zinc-600 bg-zinc-950 accent-yellow-400" />
+                  Auto-check Gemini logo on upload
+                </label>
+                <span class="rounded bg-zinc-900 px-2 py-0.5 text-[10px] text-emerald-300">Local</span>
+              </div>
+              <p class="text-[10px] leading-relaxed text-zinc-500">Uses the open-source Gemini image SDK. Only supported visible marks are processed; other images pass through unchanged. Original files remain available for restoring.</p>
+              <div class="h-1.5 w-full overflow-hidden rounded-full bg-zinc-900">
+                <div id="watermarkCleanupProgress" class="h-full w-0 rounded-full bg-yellow-400 transition-all duration-200"></div>
+              </div>
+              <p id="watermarkCleanupStatus" aria-live="polite" class="text-[10px] text-zinc-400">Ready · upload images to check</p>
+              <p class="text-[9px] text-zinc-600">Powered by <a href="https://github.com/GargantuaX/gemini-watermark-remover" target="_blank" rel="noopener noreferrer" class="underline hover:text-zinc-400">GargantuaX / gemini-watermark-remover</a> · MIT</p>
             </div>
 
             <div id="imageCardsList" class="space-y-2.5"></div>
@@ -653,6 +669,13 @@
     </div>
   </div>
 
+  <script type="importmap">
+    {
+      "imports": {
+        "@pilio/gemini-watermark-remover/browser": "./node_modules/@pilio/gemini-watermark-remover/src/sdk/browser.js"
+      }
+    }
+  </script>
   <script type="module">
     const VIDEO_WIDTH = 1080;
     const VIDEO_HEIGHT = 1920;
@@ -668,7 +691,7 @@
       voiceover: null,  // { name, url, blob, duration }
       bgm: null,        // { name, url, blob, duration }
       bgmVolume: 0.12,
-      whisperModel: 'onnx-community/whisper-tiny.en',
+      whisperModel: 'Xenova/whisper-tiny.en',
       isDemo: false,
       speechSegments: [],
       hasWhisperWords: false,
@@ -758,6 +781,9 @@
       imageInput: document.getElementById('imageInput'),
       imageDropZone: document.getElementById('imageDropZone'),
       imageCardsList: document.getElementById('imageCardsList'),
+      autoGeminiCleanupToggle: document.getElementById('autoGeminiCleanupToggle'),
+      watermarkCleanupProgress: document.getElementById('watermarkCleanupProgress'),
+      watermarkCleanupStatus: document.getElementById('watermarkCleanupStatus'),
       previewCanvas: document.getElementById('previewCanvas'),
       activeSceneBadge: document.getElementById('activeSceneBadge'),
       transitionStyleSelect: document.getElementById('transitionStyleSelect'),
@@ -847,6 +873,275 @@
       if (mode === 'quality') return { height: 1080, fps: 30, smoothing: 'high', cacheLimit: Math.max(8, DEVICE_PROFILE.cacheLimit + 2), label: 'Quality' };
       return { height: DEVICE_PROFILE.autoHeight, fps: DEVICE_PROFILE.autoFps, smoothing: DEVICE_PROFILE.smoothing, cacheLimit: DEVICE_PROFILE.cacheLimit, label: `Auto · ${DEVICE_PROFILE.tier}` };
     }
+
+    // ─── Gemini visible-logo cleanup (lazy, browser-local, worker-first) ─────
+    // The SDK is loaded only after an image upload. A single worker/engine is
+    // reused for a batch so cached alpha maps are not rebuilt for each image.
+    // npm dependency is pinned to 1.0.46; CDN routes are fallback delivery paths.
+    const GEMINI_WATERMARK_SDK_VERSION = '1.0.46';
+    const GEMINI_WATERMARK_SDK_URLS = [
+      `https://esm.sh/@pilio/gemini-watermark-remover@${GEMINI_WATERMARK_SDK_VERSION}/browser?bundle`,
+      `https://cdn.jsdelivr.net/npm/@pilio/gemini-watermark-remover@${GEMINI_WATERMARK_SDK_VERSION}/+esm`,
+    ];
+    let geminiWatermarkWorker = null;
+    let geminiWatermarkWorkerUrl = null;
+    let geminiWatermarkSdkPromise = null;
+    let geminiWatermarkMainEnginePromise = null;
+    let geminiWatermarkJobId = 0;
+    const geminiWatermarkJobs = new Map();
+
+    function setGeminiCleanupStatus(message, percent = null) {
+      if (el.watermarkCleanupStatus) el.watermarkCleanupStatus.textContent = message;
+      if (el.watermarkCleanupProgress && percent !== null) {
+        el.watermarkCleanupProgress.style.width = `${Math.max(0, Math.min(100, percent))}%`;
+      }
+    }
+
+    async function loadGeminiWatermarkSdk() {
+      if (!geminiWatermarkSdkPromise) {
+        geminiWatermarkSdkPromise = (async () => {
+          const loaders = [
+            () => import('@pilio/gemini-watermark-remover/browser'),
+            ...GEMINI_WATERMARK_SDK_URLS.map((url) => () => import(url)),
+          ];
+          const errors = [];
+          for (const load of loaders) {
+            try {
+              const sdk = await load();
+              if (typeof sdk.createWatermarkEngine === 'function' && typeof sdk.removeWatermarkFromImage === 'function') return sdk;
+              throw new Error('The loaded SDK does not expose the browser image API.');
+            } catch (error) {
+              errors.push(error?.message || String(error));
+            }
+          }
+          throw new Error(`Could not load Gemini image SDK v${GEMINI_WATERMARK_SDK_VERSION}. ${errors.join(' | ')}`);
+        })().catch((error) => {
+          geminiWatermarkSdkPromise = null;
+          throw error;
+        });
+      }
+      return geminiWatermarkSdkPromise;
+    }
+
+    const GEMINI_WATERMARK_WORKER_SOURCE = `
+      const SDK_VERSION = '1.0.46';
+      const SDK_URLS = [
+        'https://esm.sh/@pilio/gemini-watermark-remover@' + SDK_VERSION + '/browser?bundle',
+        'https://cdn.jsdelivr.net/npm/@pilio/gemini-watermark-remover@' + SDK_VERSION + '/+esm'
+      ];
+      let sdkPromise = null;
+      let enginePromise = null;
+      async function loadSdk(localSdkUrl) {
+        if (!sdkPromise) {
+          sdkPromise = (async () => {
+            const loaders = [
+              ...(localSdkUrl ? [() => import(localSdkUrl)] : []),
+              () => import('@pilio/gemini-watermark-remover/browser'),
+              ...SDK_URLS.map((url) => () => import(url))
+            ];
+            const errors = [];
+            for (const load of loaders) {
+              try {
+                const sdk = await load();
+                if (typeof sdk.createWatermarkEngine === 'function' && typeof sdk.removeWatermarkFromImage === 'function') return sdk;
+                throw new Error('Browser image API missing from SDK.');
+              } catch (error) { errors.push(error && error.message ? error.message : String(error)); }
+            }
+            throw new Error('SDK download failed: ' + errors.join(' | '));
+          })().catch((error) => { sdkPromise = null; throw error; });
+        }
+        return sdkPromise;
+      }
+      self.onmessage = async (event) => {
+        const data = event.data || {};
+        const id = data.id;
+        const file = data.file;
+        let bitmap = null;
+        try {
+          self.postMessage({ id, type: 'status', stage: 'Loading image cleanup engine…' });
+          const sdk = await loadSdk(data.localSdkUrl);
+          if (!enginePromise) enginePromise = sdk.createWatermarkEngine();
+          const engine = await enginePromise;
+          if (typeof createImageBitmap !== 'function') throw new Error('This browser does not support background image decoding.');
+          bitmap = await createImageBitmap(file);
+          self.postMessage({ id, type: 'status', stage: 'Checking supported Gemini mark…' });
+          const result = await sdk.removeWatermarkFromImage(bitmap, { engine, adaptiveMode: 'auto' });
+          if (bitmap && typeof bitmap.close === 'function') bitmap.close();
+          bitmap = null;
+          const meta = result && result.meta ? result.meta : null;
+          const applied = meta && meta.applied === true;
+          let blob = null;
+          if (applied) {
+            if (!result.canvas || typeof result.canvas.convertToBlob !== 'function') throw new Error('This browser cannot export the processed image canvas.');
+            blob = await result.canvas.convertToBlob({ type: 'image/png' });
+          }
+          self.postMessage({
+            id,
+            type: 'done',
+            applied: !!applied,
+            blob,
+            meta: meta ? { decisionTier: meta.decisionTier || null, position: meta.position || null } : null
+          });
+        } catch (error) {
+          if (bitmap && typeof bitmap.close === 'function') { try { bitmap.close(); } catch {} }
+          self.postMessage({ id, type: 'error', error: error && error.message ? error.message : String(error) });
+        }
+      };
+    `;
+
+    function ensureGeminiWatermarkWorker() {
+      if (geminiWatermarkWorker) return geminiWatermarkWorker;
+      if (typeof Worker !== 'function' || typeof OffscreenCanvas !== 'function' || typeof createImageBitmap !== 'function') {
+        throw new Error('Background image worker is not supported in this browser.');
+      }
+      geminiWatermarkWorkerUrl = URL.createObjectURL(new Blob([GEMINI_WATERMARK_WORKER_SOURCE], { type: 'text/javascript' }));
+      try {
+        geminiWatermarkWorker = new Worker(geminiWatermarkWorkerUrl, { type: 'module', name: 'gemini-image-cleanup' });
+      } catch (error) {
+        URL.revokeObjectURL(geminiWatermarkWorkerUrl);
+        geminiWatermarkWorkerUrl = null;
+        throw error;
+      }
+      geminiWatermarkWorker.addEventListener('message', (event) => {
+        const message = event.data || {};
+        const job = geminiWatermarkJobs.get(message.id);
+        if (!job) return;
+        if (message.type === 'status') {
+          job.onStage?.(message.stage || 'Processing image…');
+          return;
+        }
+        geminiWatermarkJobs.delete(message.id);
+        if (message.type === 'done') job.resolve({ applied: message.applied === true, blob: message.blob || null, meta: message.meta || null });
+        else job.reject(new Error(message.error || 'Image cleanup failed.'));
+      });
+      geminiWatermarkWorker.addEventListener('error', (event) => {
+        const reason = new Error(event.message || 'Image cleanup worker stopped unexpectedly.');
+        for (const job of geminiWatermarkJobs.values()) job.reject(reason);
+        geminiWatermarkJobs.clear();
+        try { geminiWatermarkWorker.terminate(); } catch {}
+        geminiWatermarkWorker = null;
+        if (geminiWatermarkWorkerUrl) URL.revokeObjectURL(geminiWatermarkWorkerUrl);
+        geminiWatermarkWorkerUrl = null;
+      });
+      return geminiWatermarkWorker;
+    }
+
+    function processImageInWorker(file, onStage) {
+      const worker = ensureGeminiWatermarkWorker();
+      const id = ++geminiWatermarkJobId;
+      return new Promise((resolve, reject) => {
+        geminiWatermarkJobs.set(id, { resolve, reject, onStage });
+        const localSdkUrl = new URL('./node_modules/@pilio/gemini-watermark-remover/src/sdk/browser.js', document.baseURI).href;
+        try { worker.postMessage({ id, file, localSdkUrl }); }
+        catch (error) { geminiWatermarkJobs.delete(id); reject(error); }
+      });
+    }
+
+    async function processImageOnMainThread(file) {
+      const sdk = await loadGeminiWatermarkSdk();
+      if (!geminiWatermarkMainEnginePromise) geminiWatermarkMainEnginePromise = sdk.createWatermarkEngine();
+      const engine = await geminiWatermarkMainEnginePromise;
+      let bitmap = null;
+      try {
+        if (typeof createImageBitmap === 'function') bitmap = await createImageBitmap(file);
+        else {
+          const sourceUrl = URL.createObjectURL(file);
+          try {
+            bitmap = await new Promise((resolve, reject) => {
+              const image = new Image();
+              image.onload = () => resolve(image);
+              image.onerror = () => reject(new Error('Could not decode uploaded image.'));
+              image.src = sourceUrl;
+            });
+          } finally { URL.revokeObjectURL(sourceUrl); }
+        }
+        const result = await sdk.removeWatermarkFromImage(bitmap, { engine, adaptiveMode: 'auto' });
+        const meta = result && result.meta ? result.meta : null;
+        if (!(meta && meta.applied === true)) return { applied: false, blob: null, meta };
+        const canvas = result.canvas;
+        let blob;
+        if (typeof canvas.convertToBlob === 'function') blob = await canvas.convertToBlob({ type: 'image/png' });
+        else if (typeof canvas.toBlob === 'function') {
+          blob = await new Promise((resolve, reject) => canvas.toBlob((value) => value ? resolve(value) : reject(new Error('Could not encode processed image.')), 'image/png'));
+        } else throw new Error('Processed image canvas cannot be exported in this browser.');
+        return { applied: true, blob, meta };
+      } finally {
+        if (bitmap && typeof bitmap.close === 'function') { try { bitmap.close(); } catch {} }
+      }
+    }
+
+    async function processUploadedImageWithGeminiSdk(file, onStage) {
+      try {
+        return await processImageInWorker(file, onStage);
+      } catch (workerError) {
+        console.warn('Gemini cleanup worker unavailable; using compatibility fallback:', workerError);
+        onStage?.('Using browser compatibility fallback…');
+        try { return await processImageOnMainThread(file); }
+        catch (mainError) {
+          throw new Error(`${workerError?.message || 'Worker unavailable'}; fallback: ${mainError?.message || String(mainError)}`);
+        }
+      }
+    }
+
+    function revokeImageAssetUrls(img) {
+      const urls = new Set([img?.url, img?.originalUrl, img?.cleanedUrl]);
+      for (const url of urls) if (typeof url === 'string' && url.startsWith('blob:')) URL.revokeObjectURL(url);
+    }
+
+    function watermarkStatusLabel(img) {
+      const status = img?.watermarkStatus;
+      if (status === 'queued') return 'Cleanup queued';
+      if (status === 'processing') return 'Checking Gemini logo…';
+      if (status === 'cleaned') return 'Supported Gemini logo processed';
+      if (status === 'not-detected') return 'No supported Gemini logo detected';
+      if (status === 'failed') return 'Cleanup unavailable · original kept';
+      if (status === 'disabled') return 'Auto-check disabled';
+      if (status === 'restored') return 'Original image restored';
+      return '';
+    }
+
+    async function processUploadedImagesWithGeminiSdk(images) {
+      const total = images.length;
+      let processed = 0;
+      for (const img of images) {
+        if (!state.images.some((entry) => entry.id === img.id)) continue;
+        img.watermarkStatus = 'processing';
+        setGeminiCleanupStatus(`Checking ${processed + 1} of ${total}: ${img.name}`, (processed / Math.max(1, total)) * 100);
+        renderImageCards();
+        try {
+          const result = await processUploadedImageWithGeminiSdk(img.originalFile, (stage) => {
+            setGeminiCleanupStatus(`${img.name} · ${stage}`, (processed / Math.max(1, total)) * 100);
+          });
+          const stillInProject = state.images.some((entry) => entry.id === img.id);
+          if (!stillInProject) {
+            continue;
+          }
+          if (result.applied && result.blob) {
+            const cleanUrl = URL.createObjectURL(result.blob);
+            img.cleanedUrl = cleanUrl;
+            img.cleanedFile = result.blob;
+            img.url = cleanUrl;
+            img.file = result.blob;
+            img.watermarkCleaned = true;
+            img.watermarkStatus = 'cleaned';
+          } else {
+            img.watermarkStatus = 'not-detected';
+          }
+        } catch (error) {
+          console.warn('Gemini image processing failed; original retained:', img.name, error);
+          img.watermarkStatus = 'failed';
+          img.watermarkError = error?.message || String(error);
+        }
+        processed += 1;
+        setGeminiCleanupStatus(`Checked ${processed} of ${total} images`, (processed / Math.max(1, total)) * 100);
+        renderImageCards();
+      }
+      const cleaned = images.filter((img) => img.watermarkCleaned && state.images.some((entry) => entry.id === img.id)).length;
+      const failed = images.filter((img) => img.watermarkStatus === 'failed' && state.images.some((entry) => entry.id === img.id)).length;
+      setGeminiCleanupStatus(`Finished · ${cleaned} processed · ${total - cleaned - failed} unchanged${failed ? ` · ${failed} original(s) kept after errors` : ''}`, 100);
+    }
+
+    // ─── End Gemini visible-logo cleanup integration ─────────────────────────
 
     const previewCtx = el.previewCanvas.getContext('2d', { alpha: false, desynchronized: true }) || el.previewCanvas.getContext('2d');
 
@@ -1748,53 +2043,9 @@
     let cachedWhisperRequestedModelId = null;
     let cachedWhisperRuntimePromise = null;
 
-    const WHISPER_RUNTIME_VERSION = '3.8.1';
-    const WHISPER_RUNTIME_URLS = [
-      `https://cdn.jsdelivr.net/npm/@huggingface/transformers@${WHISPER_RUNTIME_VERSION}`,
-      `https://unpkg.com/@huggingface/transformers@${WHISPER_RUNTIME_VERSION}?module`,
-      `https://esm.sh/@huggingface/transformers@${WHISPER_RUNTIME_VERSION}?bundle`,
-    ];
-
-    async function importWhisperRuntimeWithFallback() {
-      const failures = [];
-      for (const url of WHISPER_RUNTIME_URLS) {
-        try {
-          setWhisperUI('downloading', 8, `Connecting to Whisper runtime (${new URL(url).hostname})…`, 'WASM');
-          return await import(url);
-        } catch (error) {
-          failures.push(`${new URL(url).hostname}: ${error?.message || error}`);
-          console.warn('Whisper runtime CDN failed:', url, error);
-        }
-      }
-      throw new Error(`Could not load the Whisper runtime from the available CDNs. Check your internet connection or network restrictions, then retry. Details: ${failures.join(' | ')}`);
-    }
-
-    function configureWhisperRuntime(tf) {
-      tf.env.allowLocalModels = false;
-      tf.env.allowRemoteModels = true;
-      // Cache Storage is restricted in some file://, private-browsing and managed-browser contexts.
-      // Disable only the persistent cache in those contexts; model loading can still proceed.
-      let browserCacheAvailable = false;
-      try {
-        browserCacheAvailable = !!(globalThis.isSecureContext && globalThis.caches && typeof globalThis.caches.open === 'function');
-      } catch { browserCacheAvailable = false; }
-      tf.env.useBrowserCache = browserCacheAvailable;
-      if (tf.env.backends?.onnx?.wasm) {
-        const canUseThreads = !!globalThis.crossOriginIsolated && typeof SharedArrayBuffer !== 'undefined';
-        tf.env.backends.onnx.wasm.numThreads = canUseThreads
-          ? Math.max(1, Math.min(4, DEVICE_PROFILE.cores - 1))
-          : 1;
-      }
-      return browserCacheAvailable;
-    }
-
     async function getWhisperRuntime() {
       if (!cachedWhisperRuntimePromise) {
-        cachedWhisperRuntimePromise = importWhisperRuntimeWithFallback()
-          .then((tf) => {
-            configureWhisperRuntime(tf);
-            return tf;
-          })
+        cachedWhisperRuntimePromise = import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.1.2')
           .catch((error) => {
             cachedWhisperRuntimePromise = null;
             throw error;
@@ -1867,33 +2118,19 @@
         let runtimePromise = null;
         let pipe = null;
         let requestedModel = null;
-        async function getRuntime(sendProgress) {
+        async function getRuntime() {
           if (!runtimePromise) {
-            runtimePromise = (async () => {
-              const urls = [
-                'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1',
-                'https://unpkg.com/@huggingface/transformers@3.8.1?module',
-                'https://esm.sh/@huggingface/transformers@3.8.1?bundle'
-              ];
-              let lastError = null;
-              for (const url of urls) {
-                try {
-                  if (sendProgress) sendProgress({ type: 'progress', status: 'downloading', progress: 8, message: 'Loading speech engine from ' + new URL(url).hostname + '…' });
-                  const mod = await import(url);
-                  mod.env.allowLocalModels = false;
-                  mod.env.allowRemoteModels = true;
-                  let cacheAvailable = false;
-                  try { cacheAvailable = !!(self.isSecureContext && self.caches && typeof self.caches.open === 'function'); } catch (_) {}
-                  mod.env.useBrowserCache = cacheAvailable;
-                  if (mod.env.backends && mod.env.backends.onnx && mod.env.backends.onnx.wasm) {
-                    const threaded = !!self.crossOriginIsolated && typeof SharedArrayBuffer !== 'undefined';
-                    mod.env.backends.onnx.wasm.numThreads = threaded ? Math.max(1, Math.min(4, Number(self.__stickmanWhisperThreads) || 1)) : 1;
-                  }
-                  return mod;
-                } catch (err) { lastError = err; }
-              }
-              throw new Error('All Whisper runtime CDNs failed: ' + (lastError && lastError.message ? lastError.message : String(lastError)));
-            })().catch((err) => { runtimePromise = null; throw err; });
+            runtimePromise = import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.1.2')
+              .then((mod) => {
+                mod.env.allowLocalModels = false;
+                mod.env.useBrowserCache = true;
+                if (mod.env.backends && mod.env.backends.onnx && mod.env.backends.onnx.wasm) {
+                  const threaded = !!self.crossOriginIsolated && typeof SharedArrayBuffer !== 'undefined';
+                  mod.env.backends.onnx.wasm.numThreads = threaded ? Math.max(1, Math.min(4, Number(self.__stickmanWhisperThreads) || 1)) : 1;
+                }
+                return mod;
+              })
+              .catch((err) => { runtimePromise = null; throw err; });
           }
           return runtimePromise;
         }
@@ -1905,13 +2142,11 @@
           try {
             self.__stickmanWhisperThreads = Math.max(1, Math.min(4, Number(msg.numThreads) || 1));
             send({ type: 'progress', status: 'downloading', progress: 6, message: 'Starting background Whisper worker…' });
-            const tf = await getRuntime(send);
+            const tf = await getRuntime();
             if (!pipe || requestedModel !== msg.modelId) {
-              const mirrorId = msg.modelId.includes('base') ? 'Xenova/whisper-base.en' : 'Xenova/whisper-tiny.en';
               const candidates = [
                 { id: msg.modelId, dtype: 'q8' },
-                ...(msg.modelId !== mirrorId ? [{ id: mirrorId, dtype: 'q8' }] : []),
-                ...(msg.modelId.includes('base') ? [{ id: 'onnx-community/whisper-tiny.en', dtype: 'q8' }] : []),
+                ...(msg.modelId !== 'Xenova/whisper-tiny.en' ? [{ id: 'Xenova/whisper-tiny.en', dtype: 'q8' }] : []),
               ];
               let loaded = null;
               let lastError = null;
@@ -2044,17 +2279,20 @@
     async function runMainThreadWhisperTranscription(pcm16k, modelId) {
       setWhisperUI('downloading', 6, 'Loading the browser AI runtime…', 'WASM');
       const tf = await getWhisperRuntime();
-      const persistentCache = configureWhisperRuntime(tf);
-      if (!persistentCache) {
-        setWhisperUI('downloading', 9, 'Browser storage is restricted; downloading for this session only…', 'WASM');
+      tf.env.allowLocalModels = false;
+      tf.env.useBrowserCache = true;
+      if (tf.env.backends && tf.env.backends.onnx && tf.env.backends.onnx.wasm) {
+        // Multi-threaded WASM needs SharedArrayBuffer isolation. Fall back safely to one thread otherwise.
+        const canUseThreads = !!self.crossOriginIsolated && typeof SharedArrayBuffer !== 'undefined';
+        tf.env.backends.onnx.wasm.numThreads = canUseThreads
+          ? Math.max(1, Math.min(4, DEVICE_PROFILE.cores - 1))
+          : 1;
       }
 
       if (!cachedWhisperPipe || cachedWhisperRequestedModelId !== modelId) {
-        const mirrorId = modelId.includes('base') ? 'Xenova/whisper-base.en' : 'Xenova/whisper-tiny.en';
         const candidates = [
           { id: modelId, dtype: 'q8' },
-          ...(modelId !== mirrorId ? [{ id: mirrorId, dtype: 'q8' }] : []),
-          ...(modelId.includes('base') ? [{ id: 'onnx-community/whisper-tiny.en', dtype: 'q8' }] : []),
+          ...(modelId !== 'Xenova/whisper-tiny.en' ? [{ id: 'Xenova/whisper-tiny.en', dtype: 'q8' }] : []),
         ];
         let loaded = null;
         let lastErr = null;
@@ -2215,28 +2453,10 @@
     }
 
     async function decodeAudioTo16kPcm(blob) {
-      const bytes = await blob.arrayBuffer();
-      let ctx;
+      const buf = await blob.arrayBuffer();
+      const ctx = new AudioContext();
       try {
-        // Asking the browser decoder for the target rate avoids a second offline resample on modern engines.
-        ctx = new AudioContext({ sampleRate: 16000 });
-      } catch {
-        ctx = new AudioContext();
-      }
-      try {
-        const decoded = await ctx.decodeAudioData(bytes.slice(0));
-        if (decoded.sampleRate === 16000) {
-          const mono = new Float32Array(decoded.length);
-          const channels = Array.from({ length: decoded.numberOfChannels }, (_, i) => decoded.getChannelData(i));
-          const scale = 1 / Math.max(1, channels.length);
-          for (let ch = 0; ch < channels.length; ch++) {
-            const channel = channels[ch];
-            for (let i = 0; i < mono.length; i++) mono[i] += channel[i] * scale;
-          }
-          return mono;
-        }
-
-        // Compatibility fallback for browsers that ignore AudioContext.sampleRate.
+        const decoded = await ctx.decodeAudioData(buf.slice(0));
         const offline = new OfflineAudioContext(1, Math.ceil(decoded.duration * 16000), 16000);
         const src = offline.createBufferSource();
         src.buffer = decoded;
@@ -3523,9 +3743,13 @@
                 <span class="absolute inset-x-0 bottom-0 bg-black/70 py-0.5 text-[8px] font-semibold text-white opacity-0 transition group-hover:opacity-100">VIEW</span>
               </button>
               <div class="min-w-0 flex-1 space-y-1.5">
-                <div class="flex items-center justify-between gap-1.5">
-                  <span class="truncate text-[11px] font-semibold text-zinc-200">${escapeHtml(img.name)}</span>
+                <div class="flex items-start justify-between gap-1.5">
+                  <div class="min-w-0 flex flex-col gap-0.5">
+                    <span class="truncate text-[11px] font-semibold text-zinc-200">${escapeHtml(img.name)}</span>
+                    ${img.watermarkStatus ? `<span class="text-[9px] ${img.watermarkStatus === 'cleaned' ? 'text-emerald-300' : img.watermarkStatus === 'failed' ? 'text-amber-300' : 'text-zinc-500'}">${escapeHtml(watermarkStatusLabel(img))}</span>` : ''}
+                  </div>
                   <div class="flex items-center gap-1.5 shrink-0">
+                    ${img.watermarkCleaned ? `<button type="button" data-action="restore-original" data-id="${img.id}" class="rounded border border-zinc-700 bg-zinc-900 px-1.5 py-0.5 text-[9px] text-zinc-300 hover:border-yellow-400/50 hover:text-yellow-300" title="Restore the original uploaded image">Original</button>` : ''}
                     <span class="rounded bg-zinc-800 px-1.5 py-0.5 font-mono text-[10px] text-zinc-400">${img.start.toFixed(2)}s–${img.end.toFixed(2)}s</span>
                     <button type="button" data-action="delete-img" data-id="${img.id}" class="text-zinc-500 hover:text-red-400 text-xs px-1" title="Remove scene">✕</button>
                   </div>
@@ -3675,9 +3899,7 @@
       state.isDemo = false;
       state.fullScript = '';
       state.storyboardRows = [];
-      for (const img of state.images) {
-        if (img.url && img.url.startsWith('blob:')) URL.revokeObjectURL(img.url);
-      }
+      for (const img of state.images) revokeImageAssetUrls(img);
       state.images = [];
       clearBitmapCache();
       state.words = [];
@@ -3937,21 +4159,35 @@
       if (!files.length) return;
       purgeDemoAssets(true, false);
       const baseOffset = state.images.length;
+      const autoCleanup = el.autoGeminiCleanupToggle?.checked !== false;
       const added = files.map((f, idx) => {
         const row = state.storyboardRows[baseOffset + idx];
+        const originalUrl = URL.createObjectURL(f);
         return {
           id: `img-${Date.now()}-${idx}-${Math.random().toString(36).slice(2, 6)}`,
           name: f.name,
           file: f,
-          url: URL.createObjectURL(f),
+          originalFile: f,
+          originalUrl,
+          url: originalUrl,
           scriptCue: row ? row.sentence : '',
           targetStart: row ? row.start : undefined,
           targetEnd: row ? row.end : undefined,
           start: row ? row.start : 0,
           end: row ? row.end : 2,
+          watermarkStatus: autoCleanup ? 'queued' : 'disabled',
+          watermarkCleaned: false,
         };
       });
       state.images = [...state.images, ...added];
+      renderAllUI();
+
+      if (autoCleanup) {
+        await processUploadedImagesWithGeminiSdk(added);
+      } else {
+        setGeminiCleanupStatus('Auto-check is off · original images used', 0);
+      }
+
       await preloadBitmaps();
       if (state.hasWhisperWords && state.words.length > 0) {
         state.images = alignScriptToWords(state.images, state.words, getTotalDuration());
@@ -3967,8 +4203,20 @@
 
     el.addImagesBtn.addEventListener('click', () => el.imageInput.click());
     el.imageDropZone.addEventListener('click', () => el.imageInput.click());
+    el.autoGeminiCleanupToggle.addEventListener('change', () => {
+      setGeminiCleanupStatus(el.autoGeminiCleanupToggle.checked
+        ? 'Auto-check enabled · next uploads will be checked'
+        : 'Auto-check disabled · originals will be used', 0);
+    });
+
     el.imageInput.addEventListener('change', (e) => {
-      if (e.target.files?.length) handleAddImageFiles(e.target.files);
+      if (e.target.files?.length) {
+        handleAddImageFiles(e.target.files).catch((error) => {
+          console.error('Image upload workflow failed:', error);
+          setGeminiCleanupStatus(`Upload workflow error · ${error?.message || String(error)}`, 0);
+          showToast('Image upload failed. Your original files were not modified.');
+        });
+      }
       e.target.value = '';
     });
 
@@ -3982,7 +4230,13 @@
     el.imageDropZone.addEventListener('drop', (e) => {
       e.preventDefault();
       el.imageDropZone.classList.remove('border-yellow-400', 'bg-yellow-400/10');
-      if (e.dataTransfer.files?.length) handleAddImageFiles(e.dataTransfer.files);
+      if (e.dataTransfer.files?.length) {
+        handleAddImageFiles(e.dataTransfer.files).catch((error) => {
+          console.error('Dropped-image workflow failed:', error);
+          setGeminiCleanupStatus(`Upload workflow error · ${error?.message || String(error)}`, 0);
+          showToast('Image upload failed. Your original files were not modified.');
+        });
+      }
     });
 
     function moveImageToSlot(fromIdx, toIdx) {
@@ -4257,11 +4511,25 @@
       } else if (action === 'delete-img') {
         const id = btn.dataset.id;
         const removed = state.images.find((i) => i.id === id);
-        if (removed && removed.url && removed.url.startsWith('blob:')) URL.revokeObjectURL(removed.url);
+        if (removed) revokeImageAssetUrls(removed);
         releaseBitmap(id);
         state.images = state.images.filter((i) => i.id !== id);
         if (state.images.length) state.images = alignScriptToWords(state.images, state.words, getTotalDuration());
         renderAllUI();
+      } else if (action === 'restore-original') {
+        const img = state.images.find((i) => i.id === btn.dataset.id);
+        if (img && img.watermarkCleaned && img.originalFile && img.originalUrl) {
+          if (img.cleanedUrl) URL.revokeObjectURL(img.cleanedUrl);
+          img.url = img.originalUrl;
+          img.file = img.originalFile;
+          img.cleanedUrl = null;
+          img.cleanedFile = null;
+          img.watermarkCleaned = false;
+          img.watermarkStatus = 'restored';
+          releaseBitmap(img.id);
+          renderAllUI();
+          showToast(`Restored original image: ${img.name}`);
+        }
       } else if (action === 'move-up' || action === 'move-down') {
         const idx = parseInt(btn.dataset.idx, 10);
         const target = action === 'move-up' ? idx - 1 : idx + 1;
