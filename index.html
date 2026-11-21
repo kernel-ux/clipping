@@ -73,6 +73,37 @@
       <button id="toastCloseBtn" type="button" class="text-zinc-400 hover:text-white text-xs px-2">Dismiss</button>
     </div>
 
+    <!-- Whisper task overlay: model downloads are cached by the browser after the first run. -->
+    <div id="whisperLoadingModal" class="hidden fixed inset-0 z-[80] items-center justify-center bg-black/75 backdrop-blur-sm p-4" role="dialog" aria-modal="true" aria-labelledby="whisperModalTitle" aria-describedby="whisperModalMessage">
+      <div class="w-full max-w-sm rounded-2xl border border-zinc-700 bg-[#151519] p-5 shadow-2xl shadow-black/60">
+        <div class="flex items-start gap-3">
+          <div class="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-yellow-400/15 text-yellow-300">
+            <i data-lucide="audio-waveform" class="h-5 w-5"></i>
+          </div>
+          <div class="min-w-0 flex-1">
+            <h3 id="whisperModalTitle" class="text-sm font-bold text-white">Preparing Whisper AI</h3>
+            <p id="whisperModalMessage" class="mt-1 text-xs leading-relaxed text-zinc-400">Preparing your voiceover for accurate word timing. The editor stays available while Whisper works.</p>
+          </div>
+        </div>
+        <div class="mt-5 space-y-2">
+          <div class="flex items-center justify-between gap-3 text-[11px]">
+            <span id="whisperModalStage" class="min-w-0 truncate text-zinc-300">Starting…</span>
+            <span id="whisperModalPercent" class="shrink-0 font-mono text-yellow-300">Working…</span>
+          </div>
+          <div class="h-2 w-full overflow-hidden rounded-full bg-zinc-800">
+            <div id="whisperModalProgress" class="h-full w-[6%] rounded-full bg-yellow-400 transition-all duration-200"></div>
+          </div>
+        </div>
+        <div class="mt-4 flex items-center justify-between gap-3">
+          <p class="text-[10px] leading-relaxed text-zinc-500">Runs locally. Browser storage is used when available; HTTPS or localhost gives the most reliable caching.</p>
+          <div class="flex shrink-0 items-center gap-2">
+            <button id="whisperModalRetryBtn" type="button" class="hidden rounded-lg bg-yellow-400 px-3 py-2 text-[11px] font-bold text-zinc-950 transition hover:bg-yellow-300">Retry</button>
+            <button id="whisperModalHideBtn" type="button" class="rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-[11px] font-semibold text-zinc-200 transition hover:border-yellow-400/50 hover:text-yellow-200">Hide</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- 3-Panel Studio Workspace (3 side-by-side on desktop, native tabbed full-height on phones) -->
     <div class="grid flex-1 min-h-0 grid-cols-1 lg:grid-cols-[350px_1fr_330px] overflow-hidden">
       <!-- LEFT PANEL: Assets & Script -->
@@ -128,10 +159,10 @@
               <select
                 id="whisperModelSelect"
                 class="rounded-md border border-zinc-700 bg-zinc-900 px-2 py-1 text-[11px] text-zinc-300 focus:border-yellow-400 focus:outline-none"
-                title="In-browser Whisper model (cached locally once)"
+                title="In-browser Whisper model; downloaded once when browser storage is available"
               >
-                <option value="Xenova/whisper-tiny.en" selected>Whisper Tiny.en (Fast ~40MB)</option>
-                <option value="Xenova/whisper-base.en">Whisper Base.en (~75MB)</option>
+                <option value="onnx-community/whisper-tiny.en" selected>Whisper Tiny.en · Fastest (~40MB)</option>
+                <option value="onnx-community/whisper-base.en">Whisper Base.en · Slower, more capable (~75MB)</option>
               </select>
             </div>
 
@@ -294,7 +325,7 @@
             >
               <i data-lucide="image-plus" class="mx-auto mb-1.5 h-5 w-5 text-zinc-500"></i>
               <p class="text-xs font-medium text-zinc-300">Drop or click to select PNG, JPG, or WebP images</p>
-              <p class="mt-0.5 text-[11px] text-zinc-500">Drag cards or use arrows to reorder</p>
+              <p class="mt-0.5 text-[11px] text-zinc-500">Images are kept intact · Drag cards or use arrows to reorder</p>
             </div>
 
             <div id="imageCardsList" class="space-y-2.5"></div>
@@ -304,22 +335,91 @@
 
       <!-- CENTER PANEL: Live 9:16 Canvas Player -->
       <main id="centerPanelWrap" class="flex flex-col min-h-0 h-full items-center justify-between bg-[#09090b] px-3 sm:px-4 py-2.5 sm:py-4 overflow-hidden">
-        <div class="flex w-full max-w-md items-center justify-between gap-2 text-[11px] text-zinc-400">
-          <span class="inline-flex items-center gap-1.5 rounded-full border border-zinc-800 bg-zinc-900/90 px-2.5 py-1 font-medium text-zinc-300 shrink-0">
-            <span class="h-1.5 w-1.5 rounded-full bg-yellow-400"></span>
-            9:16 · 1080p
-          </span>
-          <select
-            id="transitionStyleSelect"
-            class="rounded-md border border-zinc-800 bg-zinc-900 px-2 py-1 text-[11px] font-medium text-zinc-200 focus:border-yellow-400 focus:outline-none"
-            title="Scene transition style (applied to both preview and MP4 export)"
-          >
-            <option value="crossfade-zoom" selected>Transition: Smooth Fade + Zoom</option>
-            <option value="slide-up">Transition: Slide Up</option>
-            <option value="dip-black">Transition: Cinematic Dip Black</option>
-            <option value="none">Transition: Hard Cut</option>
-          </select>
-          <span id="activeSceneBadge" class="font-mono text-zinc-400 truncate">Scene #1</span>
+        <div class="w-full max-w-md space-y-1.5">
+          <div class="flex items-center justify-between gap-2 text-[11px] text-zinc-400">
+            <span class="inline-flex items-center gap-1.5 rounded-full border border-zinc-800 bg-zinc-900/90 px-2.5 py-0.5 font-medium text-zinc-300 shrink-0">
+              <span class="h-1.5 w-1.5 rounded-full bg-yellow-400"></span>
+              9:16 · 1080p export
+            </span>
+            <span id="activeSceneBadge" class="font-mono text-zinc-400 truncate">Scene #1</span>
+          </div>
+          <div class="grid grid-cols-3 gap-1.5">
+            <select
+              id="transitionStyleSelect"
+              class="rounded-md border border-zinc-800 bg-zinc-900 px-1.5 py-1 text-[11px] font-medium text-zinc-200 focus:border-yellow-400 focus:outline-none truncate"
+              title="A calm, narration-first set of scene transitions"
+            >
+              <option value="auto-narration" selected>FX: Auto (Recommended)</option>
+              <option value="crossfade">FX: Soft Dissolve</option>
+              <option value="gentle-zoom">FX: Gentle Zoom</option>
+              <option value="none">FX: Clean Cut</option>
+            </select>
+            <select
+              id="captionStyleSelect"
+              class="rounded-md border border-zinc-800 bg-zinc-900 px-1.5 py-1 text-[11px] font-medium text-zinc-200 focus:border-yellow-400 focus:outline-none truncate"
+              title="Caption visual style"
+            >
+              <option value="viral-yellow" selected>Cap: Yellow Pop</option>
+              <option value="pill-box">Cap: Highlight Box</option>
+              <option value="cinematic-gold">Cap: Cinematic Gold</option>
+              <option value="dark-minimal">Cap: Clean Pill</option>
+              <option value="red-punch">Cap: Red Alert</option>
+            </select>
+            <select
+              id="videoSpeedSelect"
+              class="rounded-md border border-zinc-800 bg-zinc-900 px-1.5 py-1 text-[11px] font-semibold text-yellow-300 focus:border-yellow-400 focus:outline-none truncate"
+              title="Global video playback & export speed"
+            >
+              <option value="0.75">Speed: 0.75x</option>
+              <option value="0.9">Speed: 0.9x</option>
+              <option value="1" selected>Speed: 1.0x</option>
+              <option value="1.1">Speed: 1.1x</option>
+              <option value="1.15">Speed: 1.15x</option>
+              <option value="1.25">Speed: 1.25x</option>
+              <option value="1.5">Speed: 1.5x</option>
+            </select>
+          </div>
+          <div class="grid grid-cols-2 gap-1.5">
+            <select
+              id="motionStyleSelect"
+              class="min-w-0 rounded-md border border-zinc-800 bg-zinc-900 px-1.5 py-1 text-[11px] font-medium text-zinc-200 focus:border-yellow-400 focus:outline-none"
+              title="Choose subtle movement applied to each still image"
+            >
+              <option value="auto-subtle" selected>Motion: Auto Subtle</option>
+              <option value="ken-burns">Motion: Ken Burns</option>
+              <option value="slow-zoom-in">Motion: Slow Zoom In</option>
+              <option value="slow-zoom-out">Motion: Slow Zoom Out</option>
+              <option value="pan-left">Motion: Pan Left</option>
+              <option value="pan-right">Motion: Pan Right</option>
+              <option value="pan-up">Motion: Pan Up</option>
+              <option value="pan-down">Motion: Pan Down</option>
+              <option value="static">Motion: Static</option>
+            </select>
+            <label class="min-w-0 rounded-md border border-zinc-800 bg-zinc-900 px-2 py-1" for="transitionDurationRange">
+              <span class="flex items-center justify-between gap-2 text-[10px] text-zinc-400">
+                <span>Transition length</span>
+                <span id="transitionDurationLabel" class="font-mono text-yellow-300">0.42s</span>
+              </span>
+              <input id="transitionDurationRange" type="range" min="0.10" max="0.90" step="0.05" value="0.42" class="mt-1 h-1 w-full cursor-pointer appearance-none rounded-lg bg-zinc-700 accent-yellow-400" />
+            </label>
+          </div>
+          <div class="grid grid-cols-2 gap-1.5">
+            <label class="min-w-0 rounded-md border border-zinc-800 bg-zinc-900 px-2 py-1" for="previewQualitySelect">
+              <span class="block text-[10px] text-zinc-400">Preview quality</span>
+              <select id="previewQualitySelect" class="w-full bg-transparent text-[11px] font-medium text-zinc-200 focus:outline-none">
+                <option value="auto" selected>Auto (recommended)</option>
+                <option value="performance">Performance · low-end</option>
+                <option value="balanced">Balanced · everyday</option>
+                <option value="quality">Quality · sharper preview</option>
+              </select>
+            </label>
+            <div class="flex items-center rounded-md border border-zinc-800 bg-zinc-900 px-2 py-1">
+              <div class="min-w-0">
+                <span class="block text-[10px] text-zinc-400">Playback engine</span>
+                <span id="renderQualityBadge" class="block truncate text-[11px] font-medium text-emerald-300">Auto · adaptive</span>
+              </div>
+            </div>
+          </div>
         </div>
 
         <div class="relative my-2 sm:my-3 flex min-h-0 flex-1 items-center justify-center w-full overflow-hidden">
@@ -568,7 +668,7 @@
       voiceover: null,  // { name, url, blob, duration }
       bgm: null,        // { name, url, blob, duration }
       bgmVolume: 0.12,
-      whisperModel: 'Xenova/whisper-tiny.en',
+      whisperModel: 'onnx-community/whisper-tiny.en',
       isDemo: false,
       speechSegments: [],
       hasWhisperWords: false,
@@ -576,12 +676,19 @@
       guidedSyncActive: false,
       guidedNextIdx: 1,
       isTranscribing: false,
+      whisperModalDismissed: false,
       isExporting: false,
       currentTime: 0,
       isPlaying: false,
       activeTab: 'cuts', // 'cuts' | 'captions'
       leftTab: 'setup', // 'setup' | 'scenes'
-      transitionStyle: 'crossfade-zoom',
+      transitionStyle: 'auto-narration',
+      transitionDuration: 0.42,
+      transitionSeed: Math.random() * 1e9,
+      motionStyle: 'auto-subtle',
+      previewQuality: 'auto',
+      captionStyle: 'viral-yellow',
+      playbackSpeed: 1.0,
       isScrubbing: false,
       wasPlayingBeforeScrub: false,
       bitmaps: new Map(),
@@ -634,6 +741,14 @@
       whisperDeviceBadge: document.getElementById('whisperDeviceBadge'),
       whisperBarTrack: document.getElementById('whisperBarTrack'),
       whisperBar: document.getElementById('whisperBar'),
+      whisperLoadingModal: document.getElementById('whisperLoadingModal'),
+      whisperModalTitle: document.getElementById('whisperModalTitle'),
+      whisperModalMessage: document.getElementById('whisperModalMessage'),
+      whisperModalStage: document.getElementById('whisperModalStage'),
+      whisperModalPercent: document.getElementById('whisperModalPercent'),
+      whisperModalProgress: document.getElementById('whisperModalProgress'),
+      whisperModalHideBtn: document.getElementById('whisperModalHideBtn'),
+      whisperModalRetryBtn: document.getElementById('whisperModalRetryBtn'),
       fullScriptInput: document.getElementById('fullScriptInput'),
       applyTableBtn: document.getElementById('applyTableBtn'),
       storyboardHint: document.getElementById('storyboardHint'),
@@ -646,6 +761,13 @@
       previewCanvas: document.getElementById('previewCanvas'),
       activeSceneBadge: document.getElementById('activeSceneBadge'),
       transitionStyleSelect: document.getElementById('transitionStyleSelect'),
+      transitionDurationRange: document.getElementById('transitionDurationRange'),
+      transitionDurationLabel: document.getElementById('transitionDurationLabel'),
+      motionStyleSelect: document.getElementById('motionStyleSelect'),
+      previewQualitySelect: document.getElementById('previewQualitySelect'),
+      renderQualityBadge: document.getElementById('renderQualityBadge'),
+      captionStyleSelect: document.getElementById('captionStyleSelect'),
+      videoSpeedSelect: document.getElementById('videoSpeedSelect'),
       voiceAudioEl: document.getElementById('voiceAudioEl'),
       bgmAudioEl: document.getElementById('bgmAudioEl'),
       timelineScrubber: document.getElementById('timelineScrubber'),
@@ -692,7 +814,58 @@
       textEditorList: document.getElementById('textEditorList'),
     };
 
-    const previewCtx = el.previewCanvas.getContext('2d');
+    function detectDeviceProfile() {
+      const cores = Number(navigator.hardwareConcurrency) || 4;
+      const memory = Number(navigator.deviceMemory) || 4;
+      const isLow = memory <= 4 || cores <= 4;
+      const isHigh = memory >= 8 && cores >= 8;
+      const tier = isLow ? 'low' : isHigh ? 'high' : 'mid';
+      return {
+        tier,
+        cores,
+        memory,
+        prefersReducedMotion: !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches),
+        autoHeight: tier === 'low' ? 540 : tier === 'mid' ? 720 : 1080,
+        autoFps: tier === 'low' ? 24 : 30,
+        sourceMaxEdge: tier === 'high' ? 2160 : 1920,
+        smoothing: tier === 'low' ? 'medium' : 'high',
+        cacheLimit: tier === 'low' ? 5 : tier === 'mid' ? 8 : 12,
+        videoBitrate: tier === 'low' ? 8_000_000 : 10_000_000,
+      };
+    }
+
+    const DEVICE_PROFILE = detectDeviceProfile();
+    let previewWarmKey = '';
+    let previewWarmToken = 0;
+    const bitmapLoads = new Map();
+    const bitmapLastUsed = new Map();
+
+    function getPreviewSettings() {
+      const mode = state.previewQuality || 'auto';
+      if (mode === 'performance') return { height: 540, fps: 24, smoothing: 'medium', cacheLimit: Math.max(4, DEVICE_PROFILE.cacheLimit - 2), label: 'Performance' };
+      if (mode === 'balanced') return { height: 720, fps: 30, smoothing: 'high', cacheLimit: Math.max(6, DEVICE_PROFILE.cacheLimit), label: 'Balanced' };
+      if (mode === 'quality') return { height: 1080, fps: 30, smoothing: 'high', cacheLimit: Math.max(8, DEVICE_PROFILE.cacheLimit + 2), label: 'Quality' };
+      return { height: DEVICE_PROFILE.autoHeight, fps: DEVICE_PROFILE.autoFps, smoothing: DEVICE_PROFILE.smoothing, cacheLimit: DEVICE_PROFILE.cacheLimit, label: `Auto · ${DEVICE_PROFILE.tier}` };
+    }
+
+    const previewCtx = el.previewCanvas.getContext('2d', { alpha: false, desynchronized: true }) || el.previewCanvas.getContext('2d');
+
+    function resizePreviewCanvas() {
+      const rect = el.previewCanvas.getBoundingClientRect();
+      if (!rect.width || !rect.height) return;
+      const settings = getPreviewSettings();
+      const dpr = Math.min(window.devicePixelRatio || 1, settings.height >= 1080 ? 1.5 : 1.25);
+      const availableHeight = Math.min(rect.height, rect.width * (16 / 9));
+      let targetHeight = Math.min(settings.height, Math.round(availableHeight * dpr));
+      targetHeight = Math.max(360, Math.floor(targetHeight / 16) * 16);
+      const targetWidth = Math.round(targetHeight * 9 / 16);
+      if (el.previewCanvas.width !== targetWidth || el.previewCanvas.height !== targetHeight) {
+        el.previewCanvas.width = targetWidth;
+        el.previewCanvas.height = targetHeight;
+      }
+      el.renderQualityBadge.textContent = `${settings.label} · ${targetHeight}p / ${settings.fps}fps`;
+      renderPreview(true);
+    }
 
     function showToast(msg) {
       el.toastText.textContent = msg;
@@ -1238,21 +1411,75 @@
       return -(Math.cos(Math.PI * t) - 1) / 2;
     }
 
-    function easeOutCubic(t) {
-      return 1 - Math.pow(1 - t, 3);
+    function easeOutQuint(t) {
+      return 1 - Math.pow(1 - t, 5);
     }
 
-    function drawSingleSceneLayer(ctx, img, idx, currentTime, extraScale = 1, offsetY = 0, alpha = 1) {
+    function easeInOutQuart(t) {
+      return t < 0.5 ? 8 * t * t * t * t : 1 - Math.pow(-2 * t + 2, 4) / 2;
+    }
+
+    function drawSingleSceneLayer(ctx, img, idx, currentTime, extraScale = 1, offsetX = 0, offsetY = 0, alpha = 1) {
       const bitmap = state.bitmaps.get(img.id);
-      if (!bitmap || bitmap.naturalWidth <= 0 || bitmap.naturalHeight <= 0 || alpha <= 0.001) return;
+      const bitmapWidth = bitmap && (bitmap.width || bitmap.naturalWidth || 0);
+      const bitmapHeight = bitmap && (bitmap.height || bitmap.naturalHeight || 0);
+      if (!bitmap || bitmapWidth <= 0 || bitmapHeight <= 0 || alpha <= 0.001) return;
 
       const clipDur = Math.max(0.05, img.end - img.start);
       const rawProg = Math.max(0, Math.min(1, (currentTime - img.start) / clipDur));
       const eased = easeInOutSine(rawProg);
-      const kenBurns = idx % 2 === 0 ? 1.0 + 0.12 * eased : 1.12 - 0.12 * eased;
-      const zoom = kenBurns * extraScale;
+      let motionScale = 1;
+      let motionOffsetX = 0;
+      let motionOffsetY = 0;
+      let motion = state.motionStyle || 'auto-subtle';
 
-      const imgAspect = bitmap.naturalWidth / bitmap.naturalHeight;
+      if (motion === 'auto-subtle') {
+        if (DEVICE_PROFILE.prefersReducedMotion) {
+          motion = 'static';
+        } else {
+          const patterns = ['slow-zoom-in', 'slow-zoom-out', 'pan-left', 'pan-right'];
+          const seed = String(img.id || idx);
+          let hash = 2166136261;
+          for (let i = 0; i < seed.length; i++) hash = Math.imul(hash ^ seed.charCodeAt(i), 16777619);
+          motion = patterns[(hash >>> 0) % patterns.length];
+        }
+      }
+
+      switch (motion) {
+        case 'slow-zoom-in':
+          motionScale = 1 + 0.045 * eased;
+          break;
+        case 'slow-zoom-out':
+          motionScale = 1.045 - 0.045 * eased;
+          break;
+        case 'pan-left':
+          motionScale = 1.055;
+          motionOffsetX = (0.5 - eased) * 42;
+          break;
+        case 'pan-right':
+          motionScale = 1.055;
+          motionOffsetX = (eased - 0.5) * 42;
+          break;
+        case 'pan-up':
+          motionScale = 1.055;
+          motionOffsetY = (0.5 - eased) * 64;
+          break;
+        case 'pan-down':
+          motionScale = 1.055;
+          motionOffsetY = (eased - 0.5) * 64;
+          break;
+        case 'static':
+          motionScale = 1;
+          break;
+        case 'ken-burns':
+          motionScale = idx % 2 === 0 ? 1.0 + 0.10 * eased : 1.10 - 0.10 * eased;
+          break;
+        default:
+          motionScale = 1.045;
+      }
+      const zoom = motionScale * extraScale;
+
+      const imgAspect = bitmapWidth / bitmapHeight;
       const canvasAspect = VIDEO_WIDTH / VIDEO_HEIGHT;
       let drawW, drawH;
       if (Math.abs(imgAspect - canvasAspect) < 0.2) {
@@ -1272,63 +1499,75 @@
       }
 
       ctx.save();
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = ctx.canvas.width < VIDEO_WIDTH ? getPreviewSettings().smoothing : 'high';
       ctx.globalAlpha = Math.max(0, Math.min(1, alpha));
-      ctx.translate(VIDEO_WIDTH / 2, VIDEO_HEIGHT / 2 + offsetY);
-      // Clean backdrop for transparent/contain-fit stickman drawings
-      if (drawW < VIDEO_WIDTH - 2 || drawH < VIDEO_HEIGHT - 2) {
-        ctx.fillStyle = '#fafafa';
-        ctx.fillRect(-VIDEO_WIDTH / 2, -VIDEO_HEIGHT / 2, VIDEO_WIDTH, VIDEO_HEIGHT);
-      }
+      ctx.translate(VIDEO_WIDTH / 2 + offsetX + motionOffsetX, VIDEO_HEIGHT / 2 + offsetY + motionOffsetY);
       ctx.scale(zoom, zoom);
       ctx.drawImage(bitmap, -drawW / 2, -drawH / 2, drawW, drawH);
       ctx.restore();
     }
 
-    function renderStudioFrame(ctx, currentTime) {
-      ctx.save();
-      ctx.fillStyle = '#09090b';
-      ctx.fillRect(0, 0, VIDEO_WIDTH, VIDEO_HEIGHT);
-
-      let activeIdx = -1;
+    function getActiveSceneIndex(currentTime) {
       for (let i = 0; i < state.images.length; i++) {
         const img = state.images[i];
         const isLast = i === state.images.length - 1;
-        if (currentTime >= img.start && (currentTime < img.end || (isLast && currentTime <= img.end + 0.05))) {
-          activeIdx = i;
-          break;
-        }
+        if (currentTime >= img.start && (currentTime < img.end || (isLast && currentTime <= img.end + 0.05))) return i;
       }
-      if (activeIdx === -1 && state.images.length > 0) {
-        activeIdx = currentTime < state.images[0].start ? 0 : state.images.length - 1;
-      }
+      if (!state.images.length) return -1;
+      return currentTime < state.images[0].start ? 0 : state.images.length - 1;
+    }
 
+    function resolveAutoTransition(activeImg, activeIdx) {
+      if (state.transitionStyle !== 'auto-narration') return state.transitionStyle || 'crossfade';
+      // A restrained, circular sequence: 5 dissolves, 2 gentle zooms, 1 soft push.
+      // The pattern never repeats the same effect across its loop boundary. A project seed
+      // changes the starting point while keeping preview and export perfectly deterministic.
+      const pattern = ['crossfade', 'crossfade', 'gentle-zoom', 'crossfade', 'crossfade', 'push', 'crossfade', 'gentle-zoom'];
+      const offset = Math.abs(Math.floor(state.transitionSeed || 0)) % pattern.length;
+      return pattern[(Math.max(0, activeIdx) + offset) % pattern.length];
+    }
+
+    function renderStudioFrame(ctx, currentTime) {
+      ctx.save();
+      // Draw in the same 1080x1920 coordinate system for preview and final export.
+      // Preview canvas may be smaller on constrained devices; export canvas stays native 1080p.
+      const scaleX = ctx.canvas.width / VIDEO_WIDTH;
+      const scaleY = ctx.canvas.height / VIDEO_HEIGHT;
+      ctx.setTransform(scaleX, 0, 0, scaleY, 0, 0);
+      ctx.fillStyle = state.images.length > 0 ? '#fafafa' : '#09090b';
+      ctx.fillRect(0, 0, VIDEO_WIDTH, VIDEO_HEIGHT);
+
+      const activeIdx = getActiveSceneIndex(currentTime);
       if (activeIdx >= 0) {
         const activeImg = state.images[activeIdx];
-        const style = state.transitionStyle || 'crossfade-zoom';
-        const transDur = style === 'dip-black' ? 0.30 : 0.28;
+        const style = resolveAutoTransition(activeImg, activeIdx);
+        const sceneDur = Math.max(0.1, activeImg.end - activeImg.start);
+        const transDur = Math.min(state.transitionDuration || 0.42, sceneDur * 0.45);
         const elapsedInScene = currentTime - activeImg.start;
 
         if (activeIdx > 0 && style !== 'none' && elapsedInScene >= 0 && elapsedInScene < transDur) {
           const prevImg = state.images[activeIdx - 1];
-          const rawT = Math.max(0, Math.min(1, elapsedInScene / transDur));
-          const p = easeOutCubic(rawT);
+          const rawT = Math.max(0, Math.min(1, elapsedInScene / Math.max(0.08, transDur)));
+          const p = easeInOutQuart(rawT);
 
-          if (style === 'crossfade-zoom') {
-            // Smooth crossfade with subtle viral-Shorts zoom settle on the incoming scene
-            drawSingleSceneLayer(ctx, prevImg, activeIdx - 1, prevImg.end, 1 + 0.03 * p, 0, 1);
-            drawSingleSceneLayer(ctx, activeImg, activeIdx, currentTime, 1 + 0.06 * (1 - p), 0, p);
-          } else if (style === 'slide-up') {
-            drawSingleSceneLayer(ctx, prevImg, activeIdx - 1, prevImg.end, 1, -p * 220, 1 - 0.35 * p);
-            drawSingleSceneLayer(ctx, activeImg, activeIdx, currentTime, 1, (1 - p) * VIDEO_HEIGHT, Math.min(1, p * 1.35));
-          } else if (style === 'dip-black') {
-            if (rawT < 0.5) {
-              drawSingleSceneLayer(ctx, prevImg, activeIdx - 1, prevImg.end, 1, 0, 1 - rawT * 2);
-            } else {
-              drawSingleSceneLayer(ctx, activeImg, activeIdx, currentTime, 1 + 0.03 * (1 - (rawT - 0.5) * 2), 0, (rawT - 0.5) * 2);
-            }
+          if (style === 'crossfade') {
+            drawSingleSceneLayer(ctx, prevImg, activeIdx - 1, prevImg.end, 1, 0, 0, 1 - p);
+            drawSingleSceneLayer(ctx, activeImg, activeIdx, currentTime, 1, 0, 0, p);
+          } else if (style === 'gentle-zoom') {
+            // A restrained scale change plus eased dissolve; no blur filters or sub-pixel raster effects.
+            drawSingleSceneLayer(ctx, prevImg, activeIdx - 1, prevImg.end, 1 + 0.025 * p, 0, 0, 1 - p);
+            drawSingleSceneLayer(ctx, activeImg, activeIdx, currentTime, 1.025 - 0.025 * p, 0, 0, p);
+          } else if (style === 'push') {
+            // A single clean push treatment; alternate direction by cut to avoid repetition.
+            const direction = activeIdx % 2 === 0 ? -1 : 1;
+            drawSingleSceneLayer(ctx, prevImg, activeIdx - 1, prevImg.end, 1, direction * p * VIDEO_WIDTH, 0, 1);
+            drawSingleSceneLayer(ctx, activeImg, activeIdx, currentTime, 1, -direction * (1 - p) * VIDEO_WIDTH, 0, 1);
+          } else {
+            drawSingleSceneLayer(ctx, activeImg, activeIdx, currentTime, 1, 0, 0, 1);
           }
         } else {
-          drawSingleSceneLayer(ctx, activeImg, activeIdx, currentTime, 1, 0, 1);
+          drawSingleSceneLayer(ctx, activeImg, activeIdx, currentTime, 1, 0, 0, 1);
         }
       } else {
         ctx.fillStyle = '#18181c';
@@ -1343,7 +1582,6 @@
         ctx.fillText('or click "Load Demo Project"', VIDEO_WIDTH / 2, VIDEO_HEIGHT / 2 + 28);
       }
 
-      // Cached bottom vignette gradient (avoids per-frame allocation for buttery 60fps playback)
       if (!ctx._studioVig) {
         const vig = ctx.createLinearGradient(0, VIDEO_HEIGHT * 0.58, 0, VIDEO_HEIGHT);
         vig.addColorStop(0, 'rgba(0,0,0,0)');
@@ -1354,25 +1592,42 @@
       ctx.fillStyle = ctx._studioVig;
       ctx.fillRect(0, VIDEO_HEIGHT * 0.58, VIDEO_WIDTH, VIDEO_HEIGHT * 0.42);
 
-      // Viral Shorts Captions always stay crisp on top of transitions
       const activeChunk = state.captions.find(
         (c) => currentTime >= c.start - 0.02 && currentTime <= c.end + 0.04
       );
-      if (activeChunk && activeChunk.words.length > 0) {
-        drawViralCaption(ctx, activeChunk, currentTime);
-      }
+      if (activeChunk && activeChunk.words.length > 0) drawViralCaption(ctx, activeChunk, currentTime);
       ctx.restore();
     }
 
+    function drawRoundedRect(ctx, x, y, w, h, r) {
+      ctx.beginPath();
+      ctx.moveTo(x + r, y);
+      ctx.lineTo(x + w - r, y);
+      ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+      ctx.lineTo(x + w, y + h - r);
+      ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+      ctx.lineTo(x + r, y + h);
+      ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+      ctx.lineTo(x, y + r);
+      ctx.quadraticCurveTo(x, y, x + r, y);
+      ctx.closePath();
+    }
+
     function drawViralCaption(ctx, chunk, currentTime) {
-      const baseFontSize = 86;
-      const fontFamily = '"Montserrat", "Inter", "Arial Black", system-ui, sans-serif';
-      const maxLineWidth = VIDEO_WIDTH - 120;
-      const wordGap = 24;
-      const lineHeight = 112;
+      const style = state.captionStyle || 'viral-yellow';
+      const isMinimal = style === 'dark-minimal';
+      const isCinematic = style === 'cinematic-gold';
+      const baseFontSize = isMinimal ? 74 : isCinematic ? 78 : 86;
+      const fontFamily = isCinematic
+        ? 'Georgia, "Times New Roman", serif'
+        : '"Montserrat", "Inter", "Arial Black", system-ui, sans-serif';
+      const fontWeight = isCinematic ? '700' : '900';
+      const maxLineWidth = VIDEO_WIDTH - 130;
+      const wordGap = isMinimal ? 22 : 24;
+      const lineHeight = isMinimal ? 102 : 112;
 
       ctx.save();
-      ctx.font = `900 ${baseFontSize}px ${fontFamily}`;
+      ctx.font = `${fontWeight} ${baseFontSize}px ${fontFamily}`;
       ctx.textBaseline = 'middle';
       ctx.textAlign = 'center';
       ctx.lineJoin = 'round';
@@ -1389,7 +1644,7 @@
       }
 
       const measured = chunk.words.map((w, idx) => {
-        const display = w.word.toUpperCase();
+        const display = isCinematic || isMinimal ? w.word : w.word.toUpperCase();
         return { text: display, width: ctx.measureText(display).width, isActive: idx === activeWordIdx };
       });
 
@@ -1410,7 +1665,25 @@
       if (curLine.length) lines.push(curLine);
 
       const centerY = VIDEO_HEIGHT * 0.70;
-      const startY = centerY - (lines.length * lineHeight) / 2 + lineHeight / 2;
+      const totalH = lines.length * lineHeight;
+      const startY = centerY - totalH / 2 + lineHeight / 2;
+
+      // Optional full-chunk frosted dark pill for Clean Minimal or Cinematic Gold
+      if (isMinimal || isCinematic) {
+        const widest = Math.max(...lines.map((l) => l.reduce((s, w) => s + w.width, 0) + Math.max(0, l.length - 1) * wordGap));
+        const padX = 44;
+        const padY = 26;
+        const boxW = Math.min(VIDEO_WIDTH - 70, widest + padX * 2);
+        const boxH = totalH + padY * 1.4;
+        drawRoundedRect(ctx, (VIDEO_WIDTH - boxW) / 2, centerY - boxH / 2, boxW, boxH, isCinematic ? 18 : 34);
+        ctx.fillStyle = isCinematic ? 'rgba(9, 9, 11, 0.72)' : 'rgba(9, 9, 11, 0.85)';
+        ctx.fill();
+        if (isCinematic) {
+          ctx.strokeStyle = 'rgba(245, 158, 11, 0.45)';
+          ctx.lineWidth = 3;
+          ctx.stroke();
+        }
+      }
 
       lines.forEach((line, lineIdx) => {
         const totalW = line.reduce((s, w) => s + w.width, 0) + Math.max(0, line.length - 1) * wordGap;
@@ -1421,18 +1694,46 @@
           const cx = x + item.width / 2;
           ctx.save();
           ctx.translate(cx, y);
-          if (item.isActive) ctx.scale(1.08, 1.08);
-          // Fast crisp drop shadow (zero shadowBlur lag on 1080x1920 canvas)
-          ctx.strokeStyle = 'rgba(0, 0, 0, 0.65)';
-          ctx.lineWidth = 22;
-          ctx.strokeText(item.text, 0, 7);
-          // Crisp thick black outline
-          ctx.strokeStyle = '#000000';
-          ctx.lineWidth = 20;
-          ctx.strokeText(item.text, 0, 0);
-          // Active word in #FACC15 yellow, other words in crisp white
-          ctx.fillStyle = item.isActive ? '#FACC15' : '#FFFFFF';
-          ctx.fillText(item.text, 0, 0);
+
+          if (style === 'pill-box') {
+            if (item.isActive) {
+              ctx.scale(1.06, 1.06);
+              const bw = item.width + 36;
+              const bh = baseFontSize + 24;
+              drawRoundedRect(ctx, -bw / 2, -bh / 2, bw, bh, 20);
+              ctx.fillStyle = '#FACC15';
+              ctx.fill();
+              ctx.fillStyle = '#09090b';
+              ctx.fillText(item.text, 0, 2);
+            } else {
+              ctx.strokeStyle = '#000000';
+              ctx.lineWidth = 18;
+              ctx.strokeText(item.text, 0, 0);
+              ctx.fillStyle = '#FFFFFF';
+              ctx.fillText(item.text, 0, 0);
+            }
+          } else if (isMinimal) {
+            if (item.isActive) ctx.scale(1.05, 1.05);
+            ctx.fillStyle = item.isActive ? '#4ADE80' : '#F4F4F5';
+            ctx.fillText(item.text, 0, 0);
+          } else if (isCinematic) {
+            if (item.isActive) ctx.scale(1.06, 1.06);
+            ctx.fillStyle = item.isActive ? '#F59E0B' : '#FAF7F0';
+            ctx.fillText(item.text, 0, 0);
+          } else {
+            // 'viral-yellow' or 'red-punch'
+            if (item.isActive) ctx.scale(1.08, 1.08);
+            ctx.strokeStyle = 'rgba(0, 0, 0, 0.65)';
+            ctx.lineWidth = 22;
+            ctx.strokeText(item.text, 0, 7);
+            ctx.strokeStyle = '#000000';
+            ctx.lineWidth = 20;
+            ctx.strokeText(item.text, 0, 0);
+            const activeColor = style === 'red-punch' ? '#EF4444' : '#FACC15';
+            ctx.fillStyle = item.isActive ? activeColor : '#FFFFFF';
+            ctx.fillText(item.text, 0, 0);
+          }
+
           ctx.restore();
           x += item.width + wordGap;
         }
@@ -1444,6 +1745,63 @@
     // ─── Direct Main-Origin In-Browser Whisper Engine (Zero Blob-Worker CORS Bugs) ───
     let cachedWhisperPipe = null;
     let cachedWhisperModelId = null;
+    let cachedWhisperRequestedModelId = null;
+    let cachedWhisperRuntimePromise = null;
+
+    const WHISPER_RUNTIME_VERSION = '3.8.1';
+    const WHISPER_RUNTIME_URLS = [
+      `https://cdn.jsdelivr.net/npm/@huggingface/transformers@${WHISPER_RUNTIME_VERSION}`,
+      `https://unpkg.com/@huggingface/transformers@${WHISPER_RUNTIME_VERSION}?module`,
+      `https://esm.sh/@huggingface/transformers@${WHISPER_RUNTIME_VERSION}?bundle`,
+    ];
+
+    async function importWhisperRuntimeWithFallback() {
+      const failures = [];
+      for (const url of WHISPER_RUNTIME_URLS) {
+        try {
+          setWhisperUI('downloading', 8, `Connecting to Whisper runtime (${new URL(url).hostname})…`, 'WASM');
+          return await import(url);
+        } catch (error) {
+          failures.push(`${new URL(url).hostname}: ${error?.message || error}`);
+          console.warn('Whisper runtime CDN failed:', url, error);
+        }
+      }
+      throw new Error(`Could not load the Whisper runtime from the available CDNs. Check your internet connection or network restrictions, then retry. Details: ${failures.join(' | ')}`);
+    }
+
+    function configureWhisperRuntime(tf) {
+      tf.env.allowLocalModels = false;
+      tf.env.allowRemoteModels = true;
+      // Cache Storage is restricted in some file://, private-browsing and managed-browser contexts.
+      // Disable only the persistent cache in those contexts; model loading can still proceed.
+      let browserCacheAvailable = false;
+      try {
+        browserCacheAvailable = !!(globalThis.isSecureContext && globalThis.caches && typeof globalThis.caches.open === 'function');
+      } catch { browserCacheAvailable = false; }
+      tf.env.useBrowserCache = browserCacheAvailable;
+      if (tf.env.backends?.onnx?.wasm) {
+        const canUseThreads = !!globalThis.crossOriginIsolated && typeof SharedArrayBuffer !== 'undefined';
+        tf.env.backends.onnx.wasm.numThreads = canUseThreads
+          ? Math.max(1, Math.min(4, DEVICE_PROFILE.cores - 1))
+          : 1;
+      }
+      return browserCacheAvailable;
+    }
+
+    async function getWhisperRuntime() {
+      if (!cachedWhisperRuntimePromise) {
+        cachedWhisperRuntimePromise = importWhisperRuntimeWithFallback()
+          .then((tf) => {
+            configureWhisperRuntime(tf);
+            return tf;
+          })
+          .catch((error) => {
+            cachedWhisperRuntimePromise = null;
+            throw error;
+          });
+      }
+      return cachedWhisperRuntimePromise;
+    }
 
     /**
      * Normalize Whisper chunks into strictly monotonic, clamped word-level { word, start, end } timestamps.
@@ -1497,37 +1855,236 @@
       return words;
     }
 
+    // Whisper runs in a persistent module worker where supported, keeping audio inference
+    // off the UI thread. Model files remain in Transformers.js browser cache between runs.
+    let cachedWhisperWorker = null;
+    let cachedWhisperWorkerUrl = null;
+    let whisperWorkerRequestId = 0;
+
+    function createWhisperWorker() {
+      if (cachedWhisperWorker) return cachedWhisperWorker;
+      const workerSource = `
+        let runtimePromise = null;
+        let pipe = null;
+        let requestedModel = null;
+        async function getRuntime(sendProgress) {
+          if (!runtimePromise) {
+            runtimePromise = (async () => {
+              const urls = [
+                'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1',
+                'https://unpkg.com/@huggingface/transformers@3.8.1?module',
+                'https://esm.sh/@huggingface/transformers@3.8.1?bundle'
+              ];
+              let lastError = null;
+              for (const url of urls) {
+                try {
+                  if (sendProgress) sendProgress({ type: 'progress', status: 'downloading', progress: 8, message: 'Loading speech engine from ' + new URL(url).hostname + '…' });
+                  const mod = await import(url);
+                  mod.env.allowLocalModels = false;
+                  mod.env.allowRemoteModels = true;
+                  let cacheAvailable = false;
+                  try { cacheAvailable = !!(self.isSecureContext && self.caches && typeof self.caches.open === 'function'); } catch (_) {}
+                  mod.env.useBrowserCache = cacheAvailable;
+                  if (mod.env.backends && mod.env.backends.onnx && mod.env.backends.onnx.wasm) {
+                    const threaded = !!self.crossOriginIsolated && typeof SharedArrayBuffer !== 'undefined';
+                    mod.env.backends.onnx.wasm.numThreads = threaded ? Math.max(1, Math.min(4, Number(self.__stickmanWhisperThreads) || 1)) : 1;
+                  }
+                  return mod;
+                } catch (err) { lastError = err; }
+              }
+              throw new Error('All Whisper runtime CDNs failed: ' + (lastError && lastError.message ? lastError.message : String(lastError)));
+            })().catch((err) => { runtimePromise = null; throw err; });
+          }
+          return runtimePromise;
+        }
+        self.addEventListener('message', async (event) => {
+          const msg = event.data || {};
+          if (msg.type !== 'transcribe') return;
+          const requestId = msg.requestId;
+          const send = (payload) => self.postMessage({ requestId, ...payload });
+          try {
+            self.__stickmanWhisperThreads = Math.max(1, Math.min(4, Number(msg.numThreads) || 1));
+            send({ type: 'progress', status: 'downloading', progress: 6, message: 'Starting background Whisper worker…' });
+            const tf = await getRuntime(send);
+            if (!pipe || requestedModel !== msg.modelId) {
+              const mirrorId = msg.modelId.includes('base') ? 'Xenova/whisper-base.en' : 'Xenova/whisper-tiny.en';
+              const candidates = [
+                { id: msg.modelId, dtype: 'q8' },
+                ...(msg.modelId !== mirrorId ? [{ id: mirrorId, dtype: 'q8' }] : []),
+                ...(msg.modelId.includes('base') ? [{ id: 'onnx-community/whisper-tiny.en', dtype: 'q8' }] : []),
+              ];
+              let loaded = null;
+              let lastError = null;
+              for (const candidate of candidates) {
+                try {
+                  send({ type: 'progress', status: 'downloading', progress: 10, message: 'Preparing ' + candidate.id.split('/').pop() + '…' });
+                  loaded = await tf.pipeline('automatic-speech-recognition', candidate.id, {
+                    device: 'wasm',
+                    dtype: candidate.dtype,
+                    progress_callback: (info) => {
+                      if (!info) return;
+                      const file = info.file ? String(info.file).split('/').pop() : 'model files';
+                      if (info.status === 'progress' || info.status === 'downloading') {
+                        let raw = Number(info.progress);
+                        if (Number.isFinite(raw)) {
+                          if (raw > 1) raw = raw / 100;
+                          raw = Math.max(0, Math.min(1, raw));
+                        } else raw = 0.1;
+                        send({ type: 'progress', status: 'downloading', progress: Math.max(10, Math.min(86, Math.round(10 + raw * 76))), message: 'Caching ' + file + '…' });
+                      } else if (info.status === 'initiate' || info.status === 'download') {
+                        send({ type: 'progress', status: 'downloading', progress: 12, message: 'Checking browser cache for ' + file + '…' });
+                      } else if (info.status === 'done') {
+                        send({ type: 'progress', status: 'downloading', progress: 86, message: 'Loaded ' + file });
+                      }
+                    },
+                  });
+                  requestedModel = msg.modelId;
+                  pipe = loaded;
+                  break;
+                } catch (err) { lastError = err; }
+              }
+              if (!loaded) throw lastError || new Error('Could not initialize Whisper model');
+            }
+            send({ type: 'progress', status: 'transcribing', progress: 90, message: 'Whisper model ready. Finding word-level timestamps…' });
+            const pcm = new Float32Array(msg.pcmBuffer);
+            let result;
+            try {
+              result = await pipe(pcm, { chunk_length_s: 30, stride_length_s: 5, return_timestamps: 'word' });
+            } catch (wordError) {
+              result = await pipe(pcm, { chunk_length_s: 30, stride_length_s: 5, return_timestamps: true });
+            }
+            if (!result || !Array.isArray(result.chunks) || !result.chunks.length) {
+              result = await pipe(pcm, { chunk_length_s: 30, stride_length_s: 5, return_timestamps: true });
+            }
+            send({ type: 'complete', chunks: result && result.chunks ? result.chunks : [] });
+          } catch (err) {
+            send({ type: 'error', error: err && err.message ? err.message : String(err) });
+          }
+        });
+      `;
+      const blob = new Blob([workerSource], { type: 'text/javascript' });
+      cachedWhisperWorkerUrl = URL.createObjectURL(blob);
+      try {
+        cachedWhisperWorker = new Worker(cachedWhisperWorkerUrl, { type: 'module', name: 'stickman-whisper-worker' });
+      } catch (error) {
+        URL.revokeObjectURL(cachedWhisperWorkerUrl);
+        cachedWhisperWorkerUrl = null;
+        throw error;
+      }
+      cachedWhisperWorker.addEventListener('error', () => {
+        const worker = cachedWhisperWorker;
+        cachedWhisperWorker = null;
+        if (worker) worker.terminate();
+        if (cachedWhisperWorkerUrl) URL.revokeObjectURL(cachedWhisperWorkerUrl);
+        cachedWhisperWorkerUrl = null;
+      });
+      return cachedWhisperWorker;
+    }
+
+    function runWhisperWorkerTask(pcm16k, modelId, transferOwnership = false) {
+      const worker = createWhisperWorker();
+      const requestId = ++whisperWorkerRequestId;
+      return new Promise((resolve, reject) => {
+        const cleanup = () => {
+          worker.removeEventListener('message', onMessage);
+          worker.removeEventListener('error', onError);
+        };
+        const onMessage = (event) => {
+          const msg = event.data || {};
+          if (msg.requestId !== requestId) return;
+          if (msg.type === 'progress') {
+            setWhisperUI(msg.status || 'downloading', msg.progress, msg.message || 'Whisper is working…', 'WASM');
+          } else if (msg.type === 'complete') {
+            cleanup();
+            resolve(msg.chunks || []);
+          } else if (msg.type === 'error') {
+            cleanup();
+            reject(new Error(msg.error || 'Whisper worker failed'));
+          }
+        };
+        const onError = (event) => {
+          cleanup();
+          reject(new Error(event.message || 'Whisper background worker is unavailable'));
+        };
+        worker.addEventListener('message', onMessage);
+        worker.addEventListener('error', onError);
+        try {
+          // Reuse the short-audio cache, but transfer long one-off PCM buffers without
+          // duplicating hundreds of megabytes. The original audio Blob remains the fallback source.
+          const pcmForWorker = transferOwnership ? pcm16k : pcm16k.slice();
+          worker.postMessage({ type: 'transcribe', requestId, modelId, numThreads: DEVICE_PROFILE.tier === 'high' ? Math.min(4, Math.max(1, DEVICE_PROFILE.cores - 1)) : DEVICE_PROFILE.tier === 'mid' ? 2 : 1, pcmBuffer: pcmForWorker.buffer }, [pcmForWorker.buffer]);
+        } catch (error) {
+          cleanup();
+          reject(error);
+        }
+      });
+    }
+
     async function runDirectWhisperTranscription(pcm16k, modelId) {
-      setWhisperUI('downloading', 5, `Loading Whisper engine (${modelId})...`, 'WASM');
-      // Load official Transformers.js v3 ESM bundle without overriding wasmPaths (prevents 404 on ort-wasm binaries)
-      const tf = await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.1.2');
-      tf.env.allowLocalModels = false;
-      tf.env.useBrowserCache = true;
-      if (tf.env.backends && tf.env.backends.onnx && tf.env.backends.onnx.wasm) {
-        tf.env.backends.onnx.wasm.numThreads = 1;
+      try {
+        setWhisperUI('downloading', 6, 'Starting Whisper in a background worker…', 'WASM');
+        const transferOwnership = !state.voiceover?.pcm16k && state.voiceover?.duration > 180;
+        const chunks = await runWhisperWorkerTask(pcm16k, modelId, transferOwnership);
+        const maxDur = state.voiceover ? state.voiceover.duration : 60;
+        const words = normalizeWhisperChunks(chunks, maxDur);
+        if (!words.length) throw new Error('Background Whisper returned no timestamped words');
+        return words;
+      } catch (workerError) {
+        console.warn('Whisper worker unavailable; using the compatibility engine:', workerError);
+        showToast('Using the browser compatibility mode for Whisper on this device.');
+        let fallbackPcm = pcm16k;
+        if (!fallbackPcm || fallbackPcm.byteLength === 0) {
+          setWhisperUI('loading', 8, 'Preparing audio for compatibility mode…', 'WASM');
+          fallbackPcm = await decodeAudioTo16kPcm(state.voiceover.blob);
+        }
+        return runMainThreadWhisperTranscription(fallbackPcm, modelId);
+      }
+    }
+
+    async function runMainThreadWhisperTranscription(pcm16k, modelId) {
+      setWhisperUI('downloading', 6, 'Loading the browser AI runtime…', 'WASM');
+      const tf = await getWhisperRuntime();
+      const persistentCache = configureWhisperRuntime(tf);
+      if (!persistentCache) {
+        setWhisperUI('downloading', 9, 'Browser storage is restricted; downloading for this session only…', 'WASM');
       }
 
-      if (!cachedWhisperPipe || cachedWhisperModelId !== modelId) {
+      if (!cachedWhisperPipe || cachedWhisperRequestedModelId !== modelId) {
+        const mirrorId = modelId.includes('base') ? 'Xenova/whisper-base.en' : 'Xenova/whisper-tiny.en';
         const candidates = [
           { id: modelId, dtype: 'q8' },
-          { id: 'Xenova/whisper-tiny.en', dtype: 'q8' },
+          ...(modelId !== mirrorId ? [{ id: mirrorId, dtype: 'q8' }] : []),
+          ...(modelId.includes('base') ? [{ id: 'onnx-community/whisper-tiny.en', dtype: 'q8' }] : []),
         ];
         let loaded = null;
         let lastErr = null;
         for (const cand of candidates) {
           try {
+            setWhisperUI('downloading', 10, `Preparing ${cand.id.split('/').pop()} model weights…`, 'WASM');
             loaded = await tf.pipeline('automatic-speech-recognition', cand.id, {
               device: 'wasm',
               dtype: cand.dtype,
               progress_callback: (info) => {
-                if (info && (info.status === 'progress' || info.status === 'downloading')) {
-                  const pct = Math.round(info.progress || 0);
-                  setWhisperUI('downloading', pct, `Downloading ${info.file || cand.id} (${pct}%)`, 'WASM');
+                if (!info) return;
+                const file = info.file ? String(info.file).split('/').pop() : 'model files';
+                if (info.status === 'progress' || info.status === 'downloading') {
+                  let rawPct = Number(info.progress);
+                  if (Number.isFinite(rawPct)) {
+                    if (rawPct > 1) rawPct /= 100;
+                    rawPct = Math.max(0, Math.min(1, rawPct));
+                  } else rawPct = 0.1;
+                  const pct = Math.max(10, Math.min(86, Math.round(10 + rawPct * 76)));
+                  setWhisperUI('downloading', pct, `Caching ${file}…`, 'WASM');
+                } else if (info.status === 'initiate' || info.status === 'download') {
+                  setWhisperUI('downloading', 12, `Checking browser cache for ${file}…`, 'WASM');
+                } else if (info.status === 'done') {
+                  setWhisperUI('downloading', 86, `Loaded ${file}`, 'WASM');
                 }
               },
             });
             cachedWhisperPipe = loaded;
-            cachedWhisperModelId = modelId;
+            cachedWhisperModelId = cand.id;
+            cachedWhisperRequestedModelId = modelId;
             break;
           } catch (e) {
             lastErr = e;
@@ -1536,8 +2093,8 @@
         if (!loaded) throw lastErr || new Error('Could not initialize Whisper model');
       }
 
-      setWhisperUI('transcribing', 100, 'Transcribing voiceover word timestamps...', 'WASM');
-      await new Promise((r) => setTimeout(r, 30));
+      setWhisperUI('transcribing', 90, 'Whisper is ready. Finding word-level timestamps…', 'WASM');
+      await new Promise((r) => setTimeout(r, 20));
 
       const maxDur = state.voiceover ? state.voiceover.duration : 60;
       let res = null;
@@ -1548,7 +2105,7 @@
           return_timestamps: 'word',
         });
       } catch {
-        // Automatic fallback to sentence/phrase-level timestamps if word-level alignment throws
+        // Automatic fallback to phrase-level timestamps if word alignment is unsupported.
         res = await cachedWhisperPipe(pcm16k, {
           chunk_length_s: 30,
           stride_length_s: 5,
@@ -1568,9 +2125,29 @@
       return words;
     }
 
+    function explainWhisperError(error) {
+      const raw = String(error?.message || error || 'Unknown Whisper error');
+      const lower = raw.toLowerCase();
+      if (/failed to fetch|networkerror|load failed|err_name_not_resolved|fetch failed|network request failed/.test(lower)) {
+        return `Whisper could not download its runtime or model files. Check your internet connection and allow cdn.jsdelivr.net, unpkg.com, esm.sh and huggingface.co in your network or browser settings. Then press Retry. Original error: ${raw}`;
+      }
+      if (/quota|storage|cache|securityerror/.test(lower)) {
+        return `The browser blocked local model caching. Try a normal Chrome window (not Incognito), or open this HTML from localhost/HTTPS, then press Retry. Original error: ${raw}`;
+      }
+      if (/wasm|webassembly|onnxruntime|simd/.test(lower)) {
+        return `Whisper's browser compute engine could not start. Update Chrome, close other heavy tabs, and retry. Original error: ${raw}`;
+      }
+      return raw;
+    }
+
     function setWhisperUI(status, progress, message, device) {
-      el.whisperStatusText.textContent = message || 'Ready to sync';
-      el.whisperStatusText.title = message || '';
+      const safeProgress = Math.max(0, Math.min(100, Number(progress) || 0));
+      const busy = status === 'downloading' || status === 'loading' || status === 'transcribing';
+      const showError = status === 'error';
+      const statusMessage = message || 'Ready to sync';
+
+      el.whisperStatusText.textContent = statusMessage;
+      el.whisperStatusText.title = statusMessage;
       el.whisperStatusText.className =
         'truncate min-w-0 flex-1 ' +
         (status === 'error' ? 'text-red-400' : status === 'ready' ? 'text-emerald-400' : 'text-zinc-300');
@@ -1578,15 +2155,52 @@
         el.whisperDeviceBadge.textContent = device.toUpperCase();
         el.whisperDeviceBadge.classList.remove('hidden');
       }
-      const busy = status === 'downloading' || status === 'loading' || status === 'transcribing';
-      const barPct = status === 'ready' ? 100 : busy ? Math.max(6, progress || 0) : 0;
+      const barPct = status === 'ready' ? 100 : busy ? Math.max(6, safeProgress) : 0;
       el.whisperBar.style.width = `${barPct}%`;
       el.whisperBar.className = `h-full rounded-full transition-all duration-150 ${
         status === 'error' ? 'bg-red-500' : status === 'ready' ? 'bg-emerald-400' : 'bg-yellow-400'
       }`;
-      el.transcribeBtnLabel.textContent = busy ? 'Running Whisper AI...' : 'Transcribe Audio & Auto-Sync';
+      el.transcribeBtnLabel.textContent = busy ? 'Running Whisper AI…' : showError ? 'Retry Whisper Sync' : 'Transcribe Audio & Auto-Sync';
+      if (el.whisperModalRetryBtn) el.whisperModalRetryBtn.classList.toggle('hidden', !showError);
+
+      if (busy || showError) {
+        const title = showError ? 'Whisper could not load'
+          : status === 'loading' ? 'Preparing your voiceover'
+          : status === 'transcribing' ? 'Transcribing your voiceover'
+          : 'Loading Whisper AI';
+        el.whisperModalTitle.textContent = title;
+        el.whisperModalMessage.textContent = showError
+          ? 'Your audio is safe. Check the message below and retry the model download.'
+          : status === 'transcribing'
+            ? 'Whisper is analyzing your audio in the background. You can hide this panel and keep editing.'
+            : 'The first run downloads the speech model. Later runs can reuse the browser cache.';
+        el.whisperModalStage.textContent = statusMessage;
+        el.whisperModalPercent.textContent = showError ? 'Failed' : status === 'transcribing' ? 'Working…' : `${Math.round(safeProgress)}%`;
+        el.whisperModalProgress.style.width = showError ? '100%' : status === 'transcribing' ? '42%' : `${Math.max(6, safeProgress)}%`;
+        el.whisperModalProgress.classList.toggle('animate-pulse', status === 'transcribing');
+        el.whisperModalProgress.classList.toggle('bg-red-500', showError);
+        el.whisperModalProgress.classList.toggle('bg-yellow-400', !showError);
+        if (!state.whisperModalDismissed) {
+          el.whisperLoadingModal.classList.remove('hidden');
+          el.whisperLoadingModal.classList.add('flex');
+        }
+      } else {
+        el.whisperLoadingModal.classList.add('hidden');
+        el.whisperLoadingModal.classList.remove('flex');
+        el.whisperModalProgress.classList.remove('animate-pulse', 'bg-red-500');
+        el.whisperModalProgress.classList.add('bg-yellow-400');
+      }
       renderControlsState();
     }
+
+    el.whisperModalHideBtn.addEventListener('click', () => {
+      state.whisperModalDismissed = true;
+      el.whisperLoadingModal.classList.add('hidden');
+      el.whisperLoadingModal.classList.remove('flex');
+    });
+    el.whisperModalRetryBtn.addEventListener('click', () => {
+      if (!state.isTranscribing && state.voiceover) el.transcribeBtn.click();
+    });
 
     // ─── Web Audio Helpers ───────────────────────────────────────────────────
     async function getAudioDuration(blob) {
@@ -1601,10 +2215,28 @@
     }
 
     async function decodeAudioTo16kPcm(blob) {
-      const buf = await blob.arrayBuffer();
-      const ctx = new AudioContext();
+      const bytes = await blob.arrayBuffer();
+      let ctx;
       try {
-        const decoded = await ctx.decodeAudioData(buf.slice(0));
+        // Asking the browser decoder for the target rate avoids a second offline resample on modern engines.
+        ctx = new AudioContext({ sampleRate: 16000 });
+      } catch {
+        ctx = new AudioContext();
+      }
+      try {
+        const decoded = await ctx.decodeAudioData(bytes.slice(0));
+        if (decoded.sampleRate === 16000) {
+          const mono = new Float32Array(decoded.length);
+          const channels = Array.from({ length: decoded.numberOfChannels }, (_, i) => decoded.getChannelData(i));
+          const scale = 1 / Math.max(1, channels.length);
+          for (let ch = 0; ch < channels.length; ch++) {
+            const channel = channels[ch];
+            for (let i = 0; i < mono.length; i++) mono[i] += channel[i] * scale;
+          }
+          return mono;
+        }
+
+        // Compatibility fallback for browsers that ignore AudioContext.sampleRate.
         const offline = new OfflineAudioContext(1, Math.ceil(decoded.duration * 16000), 16000);
         const src = offline.createBufferSource();
         src.buffer = decoded;
@@ -1692,12 +2324,13 @@
       return { mime: '', ext: 'webm' };
     }
 
-    async function mixAudioToAudioBuffer(voiceover, bgm, bgmVolume, duration) {
+    async function mixAudioToAudioBuffer(voiceover, bgm, bgmVolume, duration, speed = 1.0) {
       const sampleRate = 48000;
-      const totalSamples = Math.ceil(sampleRate * duration);
+      const outDuration = Math.max(0.2, duration / Math.max(0.25, speed));
+      const totalSamples = Math.ceil(sampleRate * outDuration);
       const offline = new OfflineAudioContext(2, totalSamples, sampleRate);
 
-      // Master compressor/limiter prevents any digital clipping or crackling when voice + BGM mix
+      // Master gain prevents digital clipping or crackling when voice + BGM mix
       const masterGain = offline.createGain();
       masterGain.gain.value = 0.94;
       masterGain.connect(offline.destination);
@@ -1705,6 +2338,7 @@
       const voDec = await offline.decodeAudioData((await voiceover.blob.arrayBuffer()).slice(0));
       const voSrc = offline.createBufferSource();
       voSrc.buffer = voDec;
+      voSrc.playbackRate.value = speed;
       voSrc.connect(masterGain);
       voSrc.start(0);
 
@@ -1713,6 +2347,7 @@
         const bgmSrc = offline.createBufferSource();
         bgmSrc.buffer = bgmDec;
         bgmSrc.loop = true;
+        bgmSrc.playbackRate.value = speed;
         const gain = offline.createGain();
         gain.gain.value = Math.max(0, Math.min(1, bgmVolume));
         bgmSrc.connect(gain).connect(masterGain);
@@ -1739,14 +2374,14 @@
      */
     async function pickSupportedVideoConfig() {
       const codecs = ['avc1.64002a', 'avc1.4d002a', 'avc1.42002a', 'avc1.640033', 'avc1.420028'];
-      const accels = ['no-preference', 'prefer-software'];
+      const accels = ['prefer-hardware', 'no-preference', 'prefer-software'];
       for (const hardwareAcceleration of accels) {
         for (const codec of codecs) {
           const cfg = {
             codec,
             width: VIDEO_WIDTH,
             height: VIDEO_HEIGHT,
-            bitrate: 6_000_000,
+            bitrate: DEVICE_PROFILE.videoBitrate,
             framerate: VIDEO_FPS,
             hardwareAcceleration,
           };
@@ -1793,7 +2428,9 @@
       const { Muxer, ArrayBufferTarget } = await import('https://cdn.jsdelivr.net/npm/mp4-muxer@5.1.3/build/mp4-muxer.mjs');
 
       setExportUI('mixing', 6, 'Mixing 48kHz stereo audio...');
-      const mixedAudio = await mixAudioToAudioBuffer(state.voiceover, state.bgm, state.bgmVolume, duration);
+      const speed = state.playbackSpeed || 1.0;
+      const outDuration = Math.max(0.2, duration / speed);
+      const mixedAudio = await mixAudioToAudioBuffer(state.voiceover, state.bgm, state.bgmVolume, duration, speed);
 
       const target = new ArrayBufferTarget();
       const muxer = new Muxer({
@@ -1844,7 +2481,7 @@
         audioEncoder.encode(audioData);
         audioData.close();
 
-        while (audioEncoder.encodeQueueSize > 6) {
+        while (audioEncoder.encodeQueueSize > (DEVICE_PROFILE.tier === 'low' ? 3 : 6)) {
           await new Promise((r) => setTimeout(r, 4));
         }
       }
@@ -1855,14 +2492,17 @@
       const offCanvas = document.createElement('canvas');
       offCanvas.width = VIDEO_WIDTH;
       offCanvas.height = VIDEO_HEIGHT;
-      const offCtx = offCanvas.getContext('2d');
-      const totalFrames = Math.max(1, Math.ceil(duration * VIDEO_FPS));
+      const offCtx = offCanvas.getContext('2d', { alpha: false }) || offCanvas.getContext('2d');
+      const totalFrames = Math.max(1, Math.ceil(outDuration * VIDEO_FPS));
+      await ensureBitmapsForTime(0);
       const frameDurUs = Math.round(1_000_000 / VIDEO_FPS);
 
       for (let f = 0; f < totalFrames; f++) {
         if (encoderError) throw encoderError;
-        const t = f / VIDEO_FPS;
-        renderStudioFrame(offCtx, t);
+        // Map output frame time -> source timeline time at exact chosen speed
+        const sourceT = Math.min(duration, (f / VIDEO_FPS) * speed);
+        await ensureBitmapsForTime(sourceT);
+        renderStudioFrame(offCtx, sourceT);
         const vFrame = new VideoFrame(offCanvas, {
           timestamp: Math.round((f * 1_000_000) / VIDEO_FPS),
           duration: frameDurUs,
@@ -1870,7 +2510,7 @@
         videoEncoder.encode(vFrame, { keyFrame: f % (VIDEO_FPS * 2) === 0 });
         vFrame.close();
 
-        while (videoEncoder.encodeQueueSize > 6) {
+        while (videoEncoder.encodeQueueSize > (DEVICE_PROFILE.tier === 'low' ? 3 : 6)) {
           await new Promise((r) => setTimeout(r, 8));
         }
 
@@ -1931,7 +2571,8 @@
         const offCanvas = document.createElement('canvas');
         offCanvas.width = VIDEO_WIDTH;
         offCanvas.height = VIDEO_HEIGHT;
-        const offCtx = offCanvas.getContext('2d');
+        const offCtx = offCanvas.getContext('2d', { alpha: false }) || offCanvas.getContext('2d');
+        await ensureBitmapsForTime(0);
         renderStudioFrame(offCtx, 0);
 
         audioCtx = new AudioContext();
@@ -1960,7 +2601,7 @@
           ...dest.stream.getAudioTracks(),
         ]);
 
-        const recorderOpts = { videoBitsPerSecond: 6_000_000, audioBitsPerSecond: 192_000 };
+        const recorderOpts = { videoBitsPerSecond: DEVICE_PROFILE.tier === 'low' ? 8_000_000 : 12_000_000, audioBitsPerSecond: 192_000 };
         if (format.mime) recorderOpts.mimeType = format.mime;
 
         const recorder = new MediaRecorder(combinedStream, recorderOpts);
@@ -1978,9 +2619,10 @@
 
         await new Promise((resolve) => {
           let lastPct = -1;
-          const drawLoop = () => {
+          const drawLoop = async () => {
             const elapsed = audioCtx.currentTime - startCtxTime;
             const clamped = Math.min(duration, Math.max(0, elapsed));
+            await ensureBitmapsForTime(clamped);
             renderStudioFrame(offCtx, clamped);
             const pct = Math.min(99, Math.round((clamped / Math.max(0.1, duration)) * 96) + 3);
             if (pct !== lastPct) {
@@ -2065,26 +2707,146 @@
       return new Blob([ab], { type: 'audio/wav' });
     }
 
+    function bitmapDimensions(bitmap) {
+      return {
+        width: bitmap ? (bitmap.width || bitmap.naturalWidth || 0) : 0,
+        height: bitmap ? (bitmap.height || bitmap.naturalHeight || 0) : 0,
+      };
+    }
+
+    function releaseBitmap(id) {
+      const bitmap = state.bitmaps.get(id);
+      if (bitmap && typeof bitmap.close === 'function') {
+        try { bitmap.close(); } catch {}
+      }
+      state.bitmaps.delete(id);
+      bitmapLastUsed.delete(id);
+    }
+
+    function clearBitmapCache() {
+      for (const id of Array.from(state.bitmaps.keys())) releaseBitmap(id);
+      bitmapLoads.clear();
+    }
+
+    async function decodeImageAsset(img) {
+      let blob = img.file || null;
+      if (!blob) {
+        const response = await fetch(img.url);
+        if (!response.ok) throw new Error(`Unable to load ${img.name || 'image'}`);
+        blob = await response.blob();
+      }
+
+      if (typeof createImageBitmap === 'function') {
+        try {
+          let bitmap = await createImageBitmap(blob);
+          const maxEdge = DEVICE_PROFILE.sourceMaxEdge;
+          const longest = Math.max(bitmap.width, bitmap.height);
+          if (longest > maxEdge) {
+            const ratio = maxEdge / longest;
+            const resized = await createImageBitmap(bitmap, {
+              resizeWidth: Math.max(1, Math.round(bitmap.width * ratio)),
+              resizeHeight: Math.max(1, Math.round(bitmap.height * ratio)),
+              resizeQuality: 'high',
+            });
+            bitmap.close();
+            bitmap = resized;
+          }
+          return bitmap;
+        } catch (err) {
+          // Fall through to HTMLImageElement for SVGs or browsers with partial ImageBitmap support.
+        }
+      }
+
+      return await new Promise((resolve, reject) => {
+        const image = new Image();
+        if (!img.url.startsWith('blob:') && !img.url.startsWith('data:')) image.crossOrigin = 'anonymous';
+        image.onload = async () => {
+          try { if (typeof image.decode === 'function') await image.decode(); } catch {}
+          const maxEdge = DEVICE_PROFILE.sourceMaxEdge;
+          const longest = Math.max(image.naturalWidth, image.naturalHeight);
+          if (longest > maxEdge) {
+            const ratio = maxEdge / longest;
+            const canvas = document.createElement('canvas');
+            canvas.width = Math.max(1, Math.round(image.naturalWidth * ratio));
+            canvas.height = Math.max(1, Math.round(image.naturalHeight * ratio));
+            const context = canvas.getContext('2d');
+            if (context) {
+              context.imageSmoothingEnabled = true;
+              context.imageSmoothingQuality = 'high';
+              context.drawImage(image, 0, 0, canvas.width, canvas.height);
+              image.src = '';
+              resolve(canvas);
+              return;
+            }
+          }
+          resolve(image);
+        };
+        image.onerror = () => reject(new Error(`Unable to decode ${img.name || 'image'}`));
+        image.src = img.url;
+      });
+    }
+
+    async function ensureBitmapForImage(img) {
+      if (!img) return null;
+      const existing = state.bitmaps.get(img.id);
+      if (existing) {
+        bitmapLastUsed.set(img.id, performance.now());
+        return existing;
+      }
+      if (bitmapLoads.has(img.id)) return bitmapLoads.get(img.id);
+
+      const task = decodeImageAsset(img).then((bitmap) => {
+        // The user may clear/reorder assets while a decode is in flight.
+        if (!state.images.some((candidate) => candidate.id === img.id)) {
+          if (bitmap && typeof bitmap.close === 'function') bitmap.close();
+          return null;
+        }
+        state.bitmaps.set(img.id, bitmap);
+        bitmapLastUsed.set(img.id, performance.now());
+        return bitmap;
+      }).catch((error) => {
+        console.warn('Image decode failed:', img.name, error);
+        return null;
+      }).finally(() => bitmapLoads.delete(img.id));
+      bitmapLoads.set(img.id, task);
+      return task;
+    }
+
+    function trimBitmapCache(protectedIds = new Set()) {
+      const limit = getPreviewSettings().cacheLimit;
+      while (state.bitmaps.size > limit) {
+        let oldestId = null;
+        let oldestTime = Infinity;
+        for (const id of state.bitmaps.keys()) {
+          if (protectedIds.has(id)) continue;
+          const used = bitmapLastUsed.get(id) || 0;
+          if (used < oldestTime) { oldestTime = used; oldestId = id; }
+        }
+        if (oldestId == null) break;
+        releaseBitmap(oldestId);
+      }
+    }
+
+    async function ensureBitmapsForTime(time) {
+      if (!state.images.length) return;
+      const activeIdx = getActiveSceneIndex(time);
+      if (activeIdx < 0) return;
+      const indexes = [...new Set([activeIdx, activeIdx - 1, activeIdx + 1])]
+        .filter((index) => index >= 0 && index < state.images.length);
+      const protectedIds = new Set(indexes.map((index) => state.images[index].id));
+      // Prioritize the frame the viewer actually needs. Avoid a three-image decode spike
+      // on low/mid devices; high-memory devices can decode the small working set together.
+      if (DEVICE_PROFILE.tier === 'high') {
+        await Promise.all(indexes.map((index) => ensureBitmapForImage(state.images[index])));
+      } else {
+        for (const index of indexes) await ensureBitmapForImage(state.images[index]);
+      }
+      trimBitmapCache(protectedIds);
+    }
+
     async function preloadBitmaps() {
-      await Promise.all(
-        state.images.map(async (img) => {
-          const existing = state.bitmaps.get(img.id);
-          if (existing && existing.src === img.url && existing.complete && existing.naturalWidth > 0) return;
-          const elImg = new Image();
-          if (!img.url.startsWith('blob:') && !img.url.startsWith('data:')) {
-            elImg.crossOrigin = 'anonymous';
-          }
-          await new Promise((resolve) => {
-            elImg.onload = resolve;
-            elImg.onerror = resolve;
-            elImg.src = img.url;
-          });
-          if (typeof elImg.decode === 'function') {
-            try { await elImg.decode(); } catch {}
-          }
-          state.bitmaps.set(img.id, elImg);
-        })
-      );
+      await ensureBitmapsForTime(state.currentTime);
+      previewWarmKey = '';
       renderPreview();
     }
 
@@ -2094,7 +2856,7 @@
         if (hadDemo) {
           state.images = state.images.filter((i) => !String(i.id).startsWith('demo-'));
           for (const key of Array.from(state.bitmaps.keys())) {
-            if (String(key).startsWith('demo-')) state.bitmaps.delete(key);
+            if (String(key).startsWith('demo-')) releaseBitmap(key);
           }
         }
       }
@@ -2167,9 +2929,21 @@
 
       if (maxRms < 0.002) return [{ start: 0, end: duration }];
 
-      // Adaptive noise-floor threshold: quiet speech stays active, real breath/sentence pauses drop below
-      const sorted = Array.from(energies).sort((a, b) => a - b);
-      const noiseFloor = sorted[Math.floor(sorted.length * 0.15)] || 0;
+      // Estimate the 15th-percentile noise floor with a fixed histogram instead of sorting
+      // every frame. This stays linear-time and avoids a second large allocation on long audio.
+      const bins = new Uint32Array(128);
+      for (let f = 0; f < numFrames; f++) {
+        const bin = Math.min(127, Math.floor((energies[f] / maxRms) * 127));
+        bins[bin]++;
+      }
+      const targetCount = Math.floor((numFrames - 1) * 0.15);
+      let cumulative = 0;
+      let noiseBin = 0;
+      for (; noiseBin < bins.length; noiseBin++) {
+        cumulative += bins[noiseBin];
+        if (cumulative > targetCount) break;
+      }
+      const noiseFloor = (Math.min(127, noiseBin) / 127) * maxRms;
       const thresh = Math.max(noiseFloor * 2.2, maxRms * 0.06, 0.006);
 
       // Smooth with a 3-frame moving average to avoid micro-dips inside single words
@@ -2414,6 +3188,7 @@
 
     async function loadDemoProject() {
       pausePlayback();
+      state.transitionSeed = Math.random() * 1e9;
       const duration = 15.6;
       const demoScript =
         'Most creators waste hours syncing stickman frames by hand. ' +
@@ -2524,7 +3299,20 @@
     let lastDurText = '';
     let lastSceneBadge = '';
 
-    function renderPreview() {
+    function renderPreview(skipWarm = false) {
+      const activeIdxForWarm = getActiveSceneIndex(state.currentTime);
+      if (!skipWarm && activeIdxForWarm >= 0) {
+        const warmKey = [state.images[activeIdxForWarm - 1]?.id || '', state.images[activeIdxForWarm]?.id || '', state.images[activeIdxForWarm + 1]?.id || ''].join('|');
+        if (warmKey !== previewWarmKey) {
+          previewWarmKey = warmKey;
+          const token = ++previewWarmToken;
+          ensureBitmapsForTime(state.currentTime).then(() => {
+            if (token === previewWarmToken && warmKey === [state.images[getActiveSceneIndex(state.currentTime) - 1]?.id || '', state.images[getActiveSceneIndex(state.currentTime)]?.id || '', state.images[getActiveSceneIndex(state.currentTime) + 1]?.id || ''].join('|')) {
+              renderPreview(true);
+            }
+          });
+        }
+      }
       renderStudioFrame(previewCtx, state.currentTime);
       const dur = getTotalDuration();
       const maxStr = String(Math.max(0.1, dur));
@@ -2545,9 +3333,10 @@
       const activeIdx = state.images.findIndex(
         (img, idx) => state.currentTime >= img.start && (state.currentTime < img.end || (idx === state.images.length - 1 && state.currentTime <= img.end + 0.05))
       );
-      const badgeText = activeIdx >= 0
-        ? `Scene #${activeIdx + 1} (${activeIdx % 2 === 0 ? 'Zoom In' : 'Zoom Out'})`
-        : 'No Scene';
+      const motionLabel = state.motionStyle === 'auto-subtle' ? 'Auto Motion'
+        : state.motionStyle === 'static' ? 'Static'
+        : state.motionStyle.replace(/-/g, ' ').replace(/\b\w/g, (letter) => letter.toUpperCase());
+      const badgeText = activeIdx >= 0 ? `Scene #${activeIdx + 1} · ${motionLabel}` : 'No Scene';
       if (badgeText !== lastSceneBadge) {
         lastSceneBadge = badgeText;
         el.activeSceneBadge.textContent = badgeText;
@@ -2563,8 +3352,9 @@
         pausePlayback();
         return;
       }
-      // Pace canvas redraws smoothly to 30fps (~31ms) so phones stay cool & lag-free
-      if (!lastDrawTs || nowTs - lastDrawTs >= 31) {
+      // Pace preview redraws to the adaptive device/quality target; the audio clock remains authoritative.
+      const frameInterval = 1000 / getPreviewSettings().fps;
+      if (!lastDrawTs || nowTs - lastDrawTs >= frameInterval) {
         lastDrawTs = nowTs;
         state.currentTime = el.voiceAudioEl.currentTime || 0;
         renderPreview();
@@ -2582,10 +3372,13 @@
           state.currentTime = 0;
         }
         try {
+          el.voiceAudioEl.playbackRate = state.playbackSpeed;
+          if ('preservesPitch' in el.voiceAudioEl) el.voiceAudioEl.preservesPitch = true;
           await el.voiceAudioEl.play();
           if (state.bgm) {
             el.bgmAudioEl.currentTime = el.voiceAudioEl.currentTime % Math.max(0.1, state.bgm.duration);
             el.bgmAudioEl.volume = state.bgmVolume;
+            el.bgmAudioEl.playbackRate = state.playbackSpeed;
             el.bgmAudioEl.play().catch(() => {});
           }
           state.isPlaying = true;
@@ -2674,6 +3467,7 @@
     function renderControlsState() {
       el.instantSyncBtn.disabled = !getCleanScriptText();
       el.transcribeBtn.disabled = !state.voiceover || state.isTranscribing;
+      el.whisperModelSelect.disabled = state.isTranscribing;
       el.exportBtn.disabled = !state.voiceover || !state.images.length || state.isExporting;
       el.applyTableBtn.disabled = !state.fullScript.trim();
       el.autoSplitBtn.disabled = !state.fullScript.trim() || !state.images.length;
@@ -2870,16 +3664,30 @@
     // ─── Event Listeners ─────────────────────────────────────────────────────
     el.clearAllBtn.addEventListener('click', () => {
       pausePlayback();
+      state.transitionSeed = Math.random() * 1e9;
+      state.transitionStyle = 'auto-narration';
+      el.transitionStyleSelect.value = 'auto-narration';
+      state.transitionDuration = 0.42;
+      el.transitionDurationRange.value = '0.42';
+      el.transitionDurationLabel.textContent = '0.42s';
+      state.motionStyle = 'auto-subtle';
+      el.motionStyleSelect.value = 'auto-subtle';
       state.isDemo = false;
       state.fullScript = '';
       state.storyboardRows = [];
+      for (const img of state.images) {
+        if (img.url && img.url.startsWith('blob:')) URL.revokeObjectURL(img.url);
+      }
       state.images = [];
-      state.bitmaps.clear();
+      clearBitmapCache();
       state.words = [];
       state.rawWhisperWords = [];
       state.hasWhisperWords = false;
       state.captions = [];
       state.speechSegments = [];
+      state.whisperModalDismissed = false;
+      if (state.voiceover?.url?.startsWith('blob:')) URL.revokeObjectURL(state.voiceover.url);
+      if (state.bgm?.url?.startsWith('blob:')) URL.revokeObjectURL(state.bgm.url);
       state.voiceover = null;
       state.bgm = null;
       state.currentTime = 0;
@@ -2897,7 +3705,36 @@
     });
     el.transitionStyleSelect.addEventListener('change', (e) => {
       state.transitionStyle = e.target.value;
+      showToast(state.transitionStyle === 'auto-narration'
+        ? 'Auto is enabled: mostly soft dissolves, with occasional gentle zooms and a rare smooth push.'
+        : `Transition set to ${e.target.options[e.target.selectedIndex].text.replace(/^FX:\s*/, '')}.`);
       renderPreview();
+    });
+    el.transitionDurationRange.addEventListener('input', (e) => {
+      state.transitionDuration = Math.max(0.1, Math.min(0.9, parseFloat(e.target.value) || 0.42));
+      el.transitionDurationLabel.textContent = `${state.transitionDuration.toFixed(2)}s`;
+      renderPreview();
+    });
+    el.motionStyleSelect.addEventListener('change', (e) => {
+      state.motionStyle = e.target.value;
+      renderPreview();
+    });
+    el.previewQualitySelect.addEventListener('change', (e) => {
+      state.previewQuality = e.target.value;
+      resizePreviewCanvas();
+      showToast(`Preview mode: ${getPreviewSettings().label}. MP4 export remains full 1080p.`);
+    });
+    el.captionStyleSelect.addEventListener('change', (e) => {
+      state.captionStyle = e.target.value;
+      renderPreview();
+    });
+    el.videoSpeedSelect.addEventListener('change', (e) => {
+      const spd = parseFloat(e.target.value) || 1.0;
+      state.playbackSpeed = spd;
+      el.voiceAudioEl.playbackRate = spd;
+      if ('preservesPitch' in el.voiceAudioEl) el.voiceAudioEl.preservesPitch = true;
+      el.bgmAudioEl.playbackRate = spd;
+      showToast(`Video speed set to ${spd}x (applies to both preview and MP4 export)`);
     });
 
     el.voiceUploadBtn.addEventListener('click', () => el.voiceInput.click());
@@ -2906,6 +3743,7 @@
       if (!f) return;
       e.target.value = '';
       pausePlayback();
+      if (state.voiceover?.url?.startsWith('blob:')) URL.revokeObjectURL(state.voiceover.url);
       purgeDemoAssets(false, true);
       const url = URL.createObjectURL(f);
       el.voiceAudioEl.src = url;
@@ -2948,6 +3786,7 @@
       if (!f) return;
       e.target.value = '';
       const duration = await getAudioDuration(f);
+      if (state.bgm?.url?.startsWith('blob:')) URL.revokeObjectURL(state.bgm.url);
       const url = URL.createObjectURL(f);
       state.bgm = { name: f.name, url, blob: f, duration };
       el.bgmAudioEl.src = url;
@@ -2958,6 +3797,7 @@
     el.bgmRemoveBtn.addEventListener('click', () => {
       el.bgmAudioEl.pause();
       el.bgmAudioEl.removeAttribute('src');
+      if (state.bgm?.url?.startsWith('blob:')) URL.revokeObjectURL(state.bgm.url);
       state.bgm = null;
       renderAudioMeta();
     });
@@ -2973,9 +3813,18 @@
       if (!state.voiceover || state.isTranscribing) return;
       pausePlayback();
       state.isTranscribing = true;
-      setWhisperUI('loading', 5, 'Decoding voiceover audio...');
+      state.whisperModalDismissed = false;
+      setWhisperUI('loading', 5, 'Preparing voiceover audio for transcription…');
       try {
-        const pcm16k = await decodeAudioTo16kPcm(state.voiceover.blob);
+        let pcm16k = state.voiceover.pcm16k || null;
+        if (!pcm16k) {
+          pcm16k = await decodeAudioTo16kPcm(state.voiceover.blob);
+          // Short-form narration is common here. Retain its mono 16k cache for fast retries,
+          // but avoid holding a very large PCM buffer for long recordings.
+          if (state.voiceover.duration <= 180) state.voiceover.pcm16k = pcm16k;
+        }
+        setWhisperUI('loading', 8, 'Voiceover decoded. Preparing the speech model…');
+        await new Promise((resolve) => requestAnimationFrame(() => resolve()));
         state.speechSegments = detectSpeechSegmentsFromPcm(pcm16k, state.voiceover.duration);
         const extracted = await runDirectWhisperTranscription(pcm16k, state.whisperModel);
         state.isTranscribing = false;
@@ -2998,9 +3847,9 @@
         renderAllUI();
       } catch (err) {
         state.isTranscribing = false;
-        const msg = err && err.message ? err.message : 'Whisper failed to initialize';
+        const msg = explainWhisperError(err);
         setWhisperUI('error', 0, msg, 'ERR');
-        showToast(`Whisper error: ${msg}. You can use "Tap-Along Voice Sync" under the player to lock clips & subtitles 100% to your voice in 1 playback!`);
+        showToast(`Whisper couldn't load. Check the loading panel for the fix, or use Tap-Along Voice Sync as a fallback.`);
         renderControlsState();
       }
     });
@@ -3093,6 +3942,7 @@
         return {
           id: `img-${Date.now()}-${idx}-${Math.random().toString(36).slice(2, 6)}`,
           name: f.name,
+          file: f,
           url: URL.createObjectURL(f),
           scriptCue: row ? row.sentence : '',
           targetStart: row ? row.start : undefined,
@@ -3406,6 +4256,9 @@
         openImageModal(parseInt(btn.dataset.idx, 10));
       } else if (action === 'delete-img') {
         const id = btn.dataset.id;
+        const removed = state.images.find((i) => i.id === id);
+        if (removed && removed.url && removed.url.startsWith('blob:')) URL.revokeObjectURL(removed.url);
+        releaseBitmap(id);
         state.images = state.images.filter((i) => i.id !== id);
         if (state.images.length) state.images = alignScriptToWords(state.images, state.words, getTotalDuration());
         renderAllUI();
@@ -3911,8 +4764,17 @@
       }
     });
 
-    // Render static Lucide icons once on boot to prevent layout jitter, then load demo
+    // Resize preview pixels to the device and visible canvas; export always uses full 1080p.
+    if (typeof ResizeObserver !== 'undefined') {
+      const previewResizeObserver = new ResizeObserver(() => resizePreviewCanvas());
+      previewResizeObserver.observe(el.previewCanvas);
+    } else {
+      window.addEventListener('resize', resizePreviewCanvas, { passive: true });
+    }
+
+    // Render static Lucide icons once on boot to prevent layout jitter, then load demo.
     if (window.lucide) window.lucide.createIcons();
+    resizePreviewCanvas();
     loadDemoProject();
   </script>
 </body>
