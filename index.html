@@ -644,6 +644,10 @@
     };
 
     const previewCtx = el.previewCanvas.getContext('2d', { alpha: false });
+    if (previewCtx) {
+      previewCtx.imageSmoothingEnabled = true;
+      previewCtx.imageSmoothingQuality = 'high';
+    }
 
     const state = {
       images: [],
@@ -792,7 +796,7 @@
       return { name: 'balanced', previewW: 540, previewH: 960, previewFps: 30, exportW: 720, exportH: 1280, exportFps: 30, exportBitrate: 4_200_000 };
     }
 
-    // Export quality is deliberately independent from preview performance.
+    // Export quality is deliberately independent from preview performance; original source blobs are used for final renders.
     // Auto/Lite preview modes must never silently lower the downloaded video resolution.
     function resolveExportProfile() {
       if (state.exportQuality === '720') {
@@ -801,7 +805,8 @@
           exportW: 720,
           exportH: 1280,
           exportFps: 30,
-          exportBitrate: 6_000_000,
+          exportBitrate: 8_000_000,
+          audioBitrate: 192_000,
         };
       }
       return {
@@ -809,8 +814,24 @@
         exportW: 1080,
         exportH: 1920,
         exportFps: 30,
-        exportBitrate: 10_000_000,
+        exportBitrate: 16_000_000,
+        audioBitrate: 192_000,
       };
+    }
+
+    function getUpscaledSceneNames(bitmapMap, width, height) {
+      const needingUpscale = [];
+      for (const im of state.images) {
+        const bmp = bitmapMap.get(im.id);
+        if (!bmp?.width || !bmp?.height) continue;
+        const imageAspect = bmp.width / bmp.height;
+        const canvasAspect = width / height;
+        const scale = imageAspect > canvasAspect * 1.15
+          ? width / bmp.width
+          : Math.max(width / bmp.width, height / bmp.height);
+        if (scale > 1.015) needingUpscale.push({ name: im.name, scale });
+      }
+      return needingUpscale;
     }
 
     function applyPreviewCanvasResolution() {
@@ -4525,54 +4546,108 @@
     // =========================================================================
     // SECTION 10: WSOLA PITCH-PRESERVED AUDIO & MP4/WEBM EXPORTER
     // =========================================================================
-    function wsolaTimeStretchChannel(input, sampleRate, speed) {
-      if (Math.abs(speed - 1.0) < 0.005) return new Float32Array(input);
-      const winLen = Math.max(64, Math.round(sampleRate * 0.032) & ~1);
-      const halfWin = winLen / 2;
-      const searchRad = Math.round(sampleRate * 0.008);
-      const outLen = Math.max(winLen, Math.round(input.length / speed));
-      const out = new Float32Array(outLen);
-      const norm = new Float32Array(outLen);
+    async function wsolaTimeStretchStereo(leftIn, rightIn, sampleRate, speed) {
+      const inputLength = Math.min(leftIn?.length || 0, rightIn?.length || 0);
+      if (!inputLength) return { left: new Float32Array(0), right: new Float32Array(0) };
 
-      const hann = new Float32Array(winLen);
-      for (let k = 0; k < winLen; k++) {
-        hann[k] = 0.5 * (1 - Math.cos((2 * Math.PI * k) / winLen));
+      const rate = Math.max(0.5, Math.min(2.0, Number(speed) || 1));
+      const outputLength = Math.max(1, Math.round(inputLength / rate));
+      if (Math.abs(rate - 1) < 0.005) {
+        return {
+          left: leftIn.slice(0, outputLength),
+          right: rightIn.slice(0, outputLength),
+        };
       }
 
-      let prevInEnd = 0;
-      for (let outPos = 0; outPos < outLen; outPos += halfWin) {
-        const idealIn = Math.round(outPos * speed);
-        let bestIn = Math.max(0, Math.min(input.length - 1, idealIn));
+      // 40 ms analysis window / 20 ms hop is a stable speech-oriented WSOLA setup.
+      const desiredWindow = Math.max(64, Math.round(sampleRate * 0.040) & ~1);
+      const winLen = Math.min(desiredWindow, Math.max(64, inputLength & ~1));
+      const hop = Math.max(32, winLen >> 1);
+      const maxStart = Math.max(0, inputLength - winLen);
+      const searchRadius = Math.max(16, Math.round(sampleRate * 0.004));
+      const outL = new Float32Array(outputLength);
+      const outR = new Float32Array(outputLength);
+      const weightSum = new Float32Array(outputLength);
+      const window = new Float32Array(winLen);
 
-        if (outPos > 0 && prevInEnd + halfWin < input.length) {
-          const minCand = Math.max(0, idealIn - searchRad);
-          const maxCand = Math.min(input.length - halfWin - 1, idealIn + searchRad);
-          let bestCorr = -Infinity;
-          for (let cand = minCand; cand <= maxCand; cand += 4) {
-            let corr = 0;
-            for (let k = 0; k < halfWin; k += 4) {
-              corr += input[prevInEnd + k] * input[cand + k];
-            }
-            if (corr > bestCorr) {
-              bestCorr = corr;
-              bestIn = cand;
+      // Offset the Hann window by half a sample so its edge weights are non-zero;
+      // overlap normalization then preserves the beginning and ending samples.
+      for (let k = 0; k < winLen; k++) {
+        window[k] = 0.5 - 0.5 * Math.cos((2 * Math.PI * (k + 0.5)) / winLen);
+      }
+
+      let previousStart = 0;
+      let hopIndex = 0;
+      for (let outPos = 0; outPos < outputLength; outPos += hop) {
+        if ((hopIndex++ & 255) === 0) {
+          if (state.exportCancelled) throw new Error('Export cancelled');
+          await yieldToUi();
+        }
+        const idealStart = Math.round(outPos * rate);
+        let bestStart = Math.max(0, Math.min(maxStart, idealStart));
+
+        if (outPos > 0 && maxStart > 0) {
+          // Keep the input search near the absolute source-time target. When the
+          // overlap is silence/near-silence, correlation is meaningless: keep the
+          // predicted position instead of letting a zero-energy match drift.
+          const minAdvance = Math.max(1, Math.round(hop * rate * 0.55));
+          const minCandidate = Math.max(idealStart - searchRadius, previousStart + minAdvance, 0);
+          const maxCandidate = Math.min(maxStart, idealStart + searchRadius);
+          const comparisonEnd = Math.min(hop, inputLength - previousStart - hop);
+          let referenceEnergy = 0;
+          for (let k = 0; k < comparisonEnd; k += 16) {
+            const aL = leftIn[previousStart + hop + k];
+            const aR = rightIn[previousStart + hop + k];
+            referenceEnergy += aL * aL + aR * aR;
+          }
+
+          if (referenceEnergy > 1e-7 && minCandidate <= maxCandidate) {
+            let bestScore = -Infinity;
+            for (let candidate = minCandidate; candidate <= maxCandidate; candidate += 8) {
+              let cross = 0;
+              let energyA = 1e-9;
+              let energyB = 1e-9;
+              for (let k = 0; k < comparisonEnd; k += 16) {
+                const aL = leftIn[previousStart + hop + k];
+                const aR = rightIn[previousStart + hop + k];
+                const bL = leftIn[candidate + k];
+                const bR = rightIn[candidate + k];
+                cross += aL * bL + aR * bR;
+                energyA += aL * aL + aR * aR;
+                energyB += bL * bL + bR * bR;
+              }
+              if (energyB < 1e-7) continue;
+              const score = cross / Math.sqrt(energyA * energyB);
+              if (score > bestScore) {
+                bestScore = score;
+                bestStart = candidate;
+              }
             }
           }
         }
 
-        const copyLen = Math.min(winLen, outLen - outPos, input.length - bestIn);
-        for (let k = 0; k < copyLen; k++) {
-          const w = hann[k];
-          out[outPos + k] += input[bestIn + k] * w;
-          norm[outPos + k] += w;
+        const copyLength = Math.min(winLen, outputLength - outPos, inputLength - bestStart);
+        for (let k = 0; k < copyLength; k++) {
+          const weight = window[k];
+          outL[outPos + k] += leftIn[bestStart + k] * weight;
+          outR[outPos + k] += rightIn[bestStart + k] * weight;
+          weightSum[outPos + k] += weight;
         }
-        prevInEnd = Math.min(input.length - 1, bestIn + halfWin);
+        previousStart = bestStart;
       }
 
-      for (let i = 0; i < outLen; i++) {
-        if (norm[i] > 1e-4) out[i] /= norm[i];
+      for (let i = 0; i < outputLength; i++) {
+        if (weightSum[i] > 1e-6) {
+          outL[i] /= weightSum[i];
+          outR[i] /= weightSum[i];
+        } else {
+          // Defensive edge fill; normally the overlap windows cover every output sample.
+          const sourceIndex = Math.min(inputLength - 1, Math.round(i * rate));
+          outL[i] = leftIn[sourceIndex];
+          outR[i] = rightIn[sourceIndex];
+        }
       }
-      return out;
+      return { left: outL, right: outR };
     }
 
     async function resampleTo48k(audioBuffer) {
@@ -4596,33 +4671,62 @@
 
       if (state.voiceover?.audioBuffer && !state.isMuted && state.voiceVolume > 0) {
         const resampled = await resampleTo48k(state.voiceover.audioBuffer);
-        const vL = wsolaTimeStretchChannel(resampled.getChannelData(0), targetSR, speed);
-        const vR = wsolaTimeStretchChannel(resampled.getChannelData(1), targetSR, speed);
+        const stretched = wsolaTimeStretchStereo(
+          resampled.getChannelData(0),
+          resampled.getChannelData(1),
+          targetSR,
+          speed
+        );
         const vol = state.voiceVolume;
-        const lim = Math.min(outFrames, vL.length);
-        for (let i = 0; i < lim; i++) {
-          mixL[i] += vL[i] * vol;
-          mixR[i] += vR[i] * vol;
+        const limit = Math.min(outFrames, stretched.left.length, stretched.right.length);
+        for (let i = 0; i < limit; i++) {
+          mixL[i] += stretched.left[i] * vol;
+          mixR[i] += stretched.right[i] * vol;
         }
       }
 
       if (state.bgm?.audioBuffer && state.bgmVolume > 0 && !state.isMuted) {
         const resampled = await resampleTo48k(state.bgm.audioBuffer);
-        const bL = resampled.getChannelData(0);
-        const bR = resampled.getChannelData(1);
-        const vol = state.bgmVolume;
-        for (let i = 0; i < outFrames; i++) {
-          const idx = i % bL.length;
-          mixL[i] += bL[idx] * vol;
-          mixR[i] += bR[idx] * vol;
+        // Stretch BGM with the same tempo curve before looping so export matches preview speed.
+        const stretchedBgm = wsolaTimeStretchStereo(
+          resampled.getChannelData(0),
+          resampled.getChannelData(1),
+          targetSR,
+          speed
+        );
+        const bgmLength = Math.min(stretchedBgm.left.length, stretchedBgm.right.length);
+        if (bgmLength > 0) {
+          const vol = state.bgmVolume;
+          for (let i = 0; i < outFrames; i++) {
+            const idx = i % bgmLength;
+            mixL[i] += stretchedBgm.left[idx] * vol;
+            mixR[i] += stretchedBgm.right[idx] * vol;
+          }
         }
       }
 
+      // Use transparent peak headroom instead of hard clipping. Hard clipping at 0.98
+      // was flattening loud syllables when voice and BGM peaks coincided.
+      let peak = 0;
       for (let i = 0; i < outFrames; i++) {
-        mixL[i] = Math.max(-0.98, Math.min(0.98, mixL[i]));
-        mixR[i] = Math.max(-0.98, Math.min(0.98, mixR[i]));
+        peak = Math.max(peak, Math.abs(mixL[i]), Math.abs(mixR[i]));
       }
-      return { sampleRate: targetSR, left: mixL, right: mixR, length: outFrames };
+      const limiterGain = peak > 0.94 ? 0.94 / peak : 1;
+      if (limiterGain < 1) {
+        for (let i = 0; i < outFrames; i++) {
+          mixL[i] *= limiterGain;
+          mixR[i] *= limiterGain;
+        }
+      }
+
+      return {
+        sampleRate: targetSR,
+        left: mixL,
+        right: mixR,
+        length: outFrames,
+        peakBeforeLimit: peak,
+        limiterGain,
+      };
     }
 
     async function loadMp4Muxer() {
@@ -4662,7 +4766,15 @@
       const exportBitmaps = new Map();
       try {
         for (const im of state.images) {
+          // Always decode the original upload blob for export; preview thumbnails are never used here.
           exportBitmaps.set(im.id, await createImageBitmap(im.blob));
+        }
+        const upscaledScenes = getUpscaledSceneNames(exportBitmaps, profile.exportW, profile.exportH);
+        if (upscaledScenes.length) {
+          const examples = upscaledScenes.slice(0, 3).map((x) => x.name).join(', ');
+          updateProcessMenu(5, `${profile.name}: ${upscaledScenes.length}/${state.images.length} source image(s) need upscaling${examples ? ` (${examples}${upscaledScenes.length > 3 ? ', …' : ''})` : ''}. Original uploads are retained.` , steps);
+        } else {
+          updateProcessMenu(5, `${profile.name}: all source images meet the selected canvas dimensions.`, steps);
         }
 
         const hasAudioTrack = !!((state.voiceover?.audioBuffer && state.voiceVolume > 0 && !state.isMuted) || (state.bgm?.audioBuffer && state.bgmVolume > 0 && !state.isMuted));
@@ -4671,38 +4783,38 @@
 
         let chosenVideoConfig = null;
         if (hasWebCodecs && muxerMod) {
-          const level = profile.exportW === 1080 ? '0028' : '001f';
-          const candidates = [
-            { codec: `avc1.6400${level}`, width: profile.exportW, height: profile.exportH, bitrate: profile.exportBitrate, hardwareAcceleration: 'prefer-hardware' },
-            { codec: `avc1.4d00${level}`, width: profile.exportW, height: profile.exportH, bitrate: profile.exportBitrate, hardwareAcceleration: 'prefer-hardware' },
-            { codec: `avc1.4200${level}`, width: profile.exportW, height: profile.exportH, bitrate: profile.exportBitrate, hardwareAcceleration: 'prefer-hardware' },
-            { codec: `avc1.6400${level}`, width: profile.exportW, height: profile.exportH, bitrate: profile.exportBitrate },
-            { codec: `avc1.4d00${level}`, width: profile.exportW, height: profile.exportH, bitrate: profile.exportBitrate },
-            { codec: `avc1.4200${level}`, width: profile.exportW, height: profile.exportH, bitrate: profile.exportBitrate },
-          ];
-          for (const c of candidates) {
-            try {
-              const config = {
-                codec: c.codec,
-                width: c.width,
-                height: c.height,
-                bitrate: c.bitrate,
-                framerate: fps,
-                ...(c.hardwareAcceleration ? { hardwareAcceleration: c.hardwareAcceleration } : {}),
-              };
-              const sup = await VideoEncoder.isConfigSupported(config);
-              if (sup?.supported) {
-                chosenVideoConfig = config;
-                break;
-              }
-            } catch {}
+          // AVC codec identifiers are exactly 6 hex digits after "avc1." (PPCCLL).
+          // The previous interpolated form inserted an extra "00", making every candidate invalid.
+          const codecCandidates = profile.exportW === 1080
+            ? ['avc1.640028', 'avc1.4d0028', 'avc1.420028']
+            : ['avc1.64001f', 'avc1.4d001f', 'avc1.42001f'];
+          const accelerationHints = ['prefer-hardware', 'prefer-software', null];
+          for (const codec of codecCandidates) {
+            for (const acceleration of accelerationHints) {
+              try {
+                const config = {
+                  codec,
+                  width: profile.exportW,
+                  height: profile.exportH,
+                  bitrate: profile.exportBitrate,
+                  framerate: fps,
+                  ...(acceleration ? { hardwareAcceleration: acceleration } : {}),
+                };
+                const supported = await VideoEncoder.isConfigSupported(config);
+                if (supported?.supported) {
+                  chosenVideoConfig = supported.config || config;
+                  break;
+                }
+              } catch {}
+            }
+            if (chosenVideoConfig) break;
           }
         }
 
         let canEncodeAac = false;
         if (hasAudioTrack && typeof AudioEncoder !== 'undefined' && typeof AudioData !== 'undefined') {
           try {
-            const aSup = await AudioEncoder.isConfigSupported({ codec: 'mp4a.40.2', numberOfChannels: 2, sampleRate: 48000, bitrate: 128_000 });
+            const aSup = await AudioEncoder.isConfigSupported({ codec: 'mp4a.40.2', numberOfChannels: 2, sampleRate: 48000, bitrate: profile.audioBitrate || 192_000 });
             canEncodeAac = !!aSup?.supported;
           } catch {}
         }
@@ -4718,9 +4830,13 @@
             fastStart: 'in-memory',
           });
 
+          let videoEncoderError = null;
           const videoEncoder = new VideoEncoder({
             output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
-            error: (e) => console.error('VideoEncoder error:', e),
+            error: (e) => {
+              videoEncoderError = e;
+              console.error('VideoEncoder error:', e);
+            },
           });
           try {
             videoEncoder.configure(chosenVideoConfig);
@@ -4732,28 +4848,58 @@
           }
 
           if (canEncodeAac) {
-            const mixed = await buildMixedExportAudioBuffer(speed);
-            const audioEncoder = new AudioEncoder({
-              output: (chunk, meta) => muxer.addAudioChunk(chunk, meta),
-              error: (e) => console.error('AudioEncoder error:', e),
-            });
-            audioEncoder.configure({ codec: 'mp4a.40.2', numberOfChannels: 2, sampleRate: 48000, bitrate: 128_000 });
-
-            const chunkFrames = 4800;
-            for (let off = 0; off < mixed.length; off += chunkFrames) {
-              const count = Math.min(chunkFrames, mixed.length - off);
-              const planar = new Float32Array(count * 2);
-              planar.set(mixed.left.subarray(off, off + count), 0);
-              planar.set(mixed.right.subarray(off, off + count), count);
-              const audioData = new AudioData({
-                format: 'f32-planar', sampleRate: 48000, numberOfFrames: count, numberOfChannels: 2,
-                timestamp: Math.round((off / 48000) * 1_000_000), data: planar,
+            let audioEncoder = null;
+            let audioEncoderError = null;
+            try {
+              const mixed = await buildMixedExportAudioBuffer(speed);
+              audioEncoder = new AudioEncoder({
+                output: (chunk, meta) => muxer.addAudioChunk(chunk, meta),
+                error: (e) => {
+                  audioEncoderError = e;
+                  console.error('AudioEncoder error:', e);
+                },
               });
-              audioEncoder.encode(audioData);
-              audioData.close();
+              audioEncoder.configure({ codec: 'mp4a.40.2', numberOfChannels: 2, sampleRate: 48000, bitrate: profile.audioBitrate || 192_000 });
+
+              const chunkFrames = 4800;
+              for (let off = 0; off < mixed.length; off += chunkFrames) {
+                if (state.exportCancelled) throw new Error('Export cancelled');
+                const count = Math.min(chunkFrames, mixed.length - off);
+                const planar = new Float32Array(count * 2);
+                planar.set(mixed.left.subarray(off, off + count), 0);
+                planar.set(mixed.right.subarray(off, off + count), count);
+                const audioData = new AudioData({
+                  format: 'f32-planar', sampleRate: 48000, numberOfFrames: count, numberOfChannels: 2,
+                  timestamp: Math.round((off / 48000) * 1_000_000), data: planar,
+                });
+                audioEncoder.encode(audioData);
+                audioData.close();
+                if (audioEncoder.encodeQueueSize > 16) {
+                  await new Promise((resolve) => {
+                    const previousHandler = audioEncoder.ondequeue;
+                    let settled = false;
+                    const finish = () => {
+                      if (settled) return;
+                      settled = true;
+                      audioEncoder.ondequeue = previousHandler || null;
+                      resolve();
+                    };
+                    audioEncoder.ondequeue = finish;
+                    setTimeout(finish, 30);
+                  });
+                }
+              }
+              await audioEncoder.flush();
+              audioEncoder.close();
+              if (audioEncoderError) throw audioEncoderError;
+            } catch (audioError) {
+              try { if (audioEncoder && audioEncoder.state !== 'closed') audioEncoder.close(); } catch {}
+              try { if (videoEncoder.state !== 'closed') videoEncoder.close(); } catch {}
+              if (audioError?.message === 'Export cancelled') throw audioError;
+              console.warn('AAC export path failed; using same-resolution MediaRecorder fallback:', audioError);
+              await exportWithAudioMediaRecorderFallback(exportBitmaps, outDur, speed, steps, profile);
+              return;
             }
-            await audioEncoder.flush();
-            audioEncoder.close();
           }
 
           const expCanvas = document.createElement('canvas');
@@ -4791,8 +4937,20 @@
 
           steps[1].done = true; steps[1].active = false; steps[2].active = true;
           updateProcessMenu(97, 'Finalizing MP4 container...', steps);
-          await videoEncoder.flush();
+          try {
+            await videoEncoder.flush();
+          } catch (flushError) {
+            try { if (videoEncoder.state !== 'closed') videoEncoder.close(); } catch {}
+            console.warn('MP4 video flush failed; using same-resolution recorder fallback:', flushError);
+            await exportWithAudioMediaRecorderFallback(exportBitmaps, outDur, speed, steps, profile);
+            return;
+          }
           videoEncoder.close();
+          if (videoEncoderError) {
+            console.warn('MP4 video encoder reported an error; using same-resolution recorder fallback:', videoEncoderError);
+            await exportWithAudioMediaRecorderFallback(exportBitmaps, outDur, speed, steps, profile);
+            return;
+          }
           muxer.finalize();
 
           triggerDownload(new Blob([muxer.target.buffer], { type: 'video/mp4' }), `stickman_studio_${Date.now()}.mp4`);
@@ -4815,85 +4973,141 @@
 
     async function exportWithAudioMediaRecorderFallback(exportBitmaps, outDur, speed, steps, profile = resolveExportProfile()) {
       steps[0].done = true; steps[0].active = false; steps[1].active = true;
-      updateProcessMenu(12, `Preparing ${profile.name} recording and pitch-safe audio...`, steps);
+      updateProcessMenu(12, `Preparing ${profile.name} recording and synchronized audio...`, steps);
 
       const canvas = document.createElement('canvas');
       canvas.width = profile.exportW;
       canvas.height = profile.exportH;
       const ctx = canvas.getContext('2d', { alpha: false });
+      if (!ctx) throw new Error('Could not create the export canvas.');
       ctx.imageSmoothingEnabled = true;
       ctx.imageSmoothingQuality = 'high';
-      const videoStream = canvas.captureStream(profile.exportFps);
+
+      let videoStream;
+      let requestedManualCapture = true;
+      try {
+        videoStream = canvas.captureStream(0);
+      } catch {
+        requestedManualCapture = false;
+        videoStream = canvas.captureStream(profile.exportFps);
+      }
+      let videoTrack = videoStream.getVideoTracks()[0];
+      let manualFrameCapture = !!(requestedManualCapture && videoTrack && typeof videoTrack.requestFrame === 'function');
+      if (requestedManualCapture && !manualFrameCapture) {
+        // requestFrame is not available in every browser; use the native fixed-rate track there.
+        for (const track of videoStream.getTracks()) track.stop();
+        videoStream = canvas.captureStream(profile.exportFps);
+        videoTrack = videoStream.getVideoTracks()[0];
+      }
+      try { if (videoTrack && 'contentHint' in videoTrack) videoTrack.contentHint = 'detail'; } catch {}
 
       const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) throw new Error('Web Audio is not available in this browser.');
       const recAudioCtx = new Ctx({ sampleRate: 48000 });
       const dest = recAudioCtx.createMediaStreamDestination();
-      const mixed = await buildMixedExportAudioBuffer(speed);
-      const outBuf = recAudioCtx.createBuffer(2, mixed.length, mixed.sampleRate);
-      outBuf.copyToChannel(mixed.left, 0);
-      outBuf.copyToChannel(mixed.right, 1);
-
-      const audioSrc = recAudioCtx.createBufferSource();
-      audioSrc.buffer = outBuf;
-      audioSrc.connect(dest);
-
-      const combinedStream = new MediaStream([
-        ...videoStream.getVideoTracks(),
-        ...dest.stream.getAudioTracks(),
-      ]);
-
-      // Prefer MP4 when the browser's MediaRecorder supports it; otherwise use
-      // the best supported WebM codec. The file extension always follows the
-      // actual recorder output instead of pretending WebM is MP4.
-      const mimeCandidates = [
-        'video/mp4;codecs=avc1.640028,mp4a.40.2',
-        'video/mp4;codecs=avc1.4d0028,mp4a.40.2',
-        'video/mp4',
-        'video/webm;codecs=vp9,opus',
-        'video/webm;codecs=vp8,opus',
-        'video/webm',
-      ];
-      const mime = mimeCandidates.find((type) => MediaRecorder.isTypeSupported(type)) || '';
-      const recorderOptions = {
-        videoBitsPerSecond: profile.exportBitrate,
-        audioBitsPerSecond: 192_000,
-      };
-      if (mime) recorderOptions.mimeType = mime;
-      const rec = new MediaRecorder(combinedStream, recorderOptions);
-      const outputMime = rec.mimeType || mime || 'video/webm';
-      const outputExtension = outputMime.includes('mp4') ? 'mp4' : 'webm';
+      let audioSrc = null;
+      let rec = null;
+      let recorderStarted = false;
+      let donePromise = null;
+      let outputMime = '';
+      let outputExtension = 'webm';
       const chunks = [];
-      rec.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
-      const donePromise = new Promise((resolve) => { rec.onstop = resolve; });
-
-      await recAudioCtx.resume();
-      rec.start();
-      audioSrc.start(0);
-      const startPerf = performance.now();
 
       try {
+        const mixed = await buildMixedExportAudioBuffer(speed);
+        const outBuf = recAudioCtx.createBuffer(2, mixed.length, mixed.sampleRate);
+        outBuf.copyToChannel(mixed.left, 0);
+        outBuf.copyToChannel(mixed.right, 1);
+
+        audioSrc = recAudioCtx.createBufferSource();
+        audioSrc.buffer = outBuf;
+        audioSrc.connect(dest);
+
+        const combinedStream = new MediaStream([
+          ...videoStream.getVideoTracks(),
+          ...dest.stream.getAudioTracks(),
+        ]);
+
+        const h264Codec = profile.exportW === 1080 ? 'avc1.640028' : 'avc1.64001f';
+        const mimeCandidates = [
+          `video/mp4;codecs=${h264Codec},mp4a.40.2`,
+          'video/mp4',
+          'video/webm;codecs=vp9,opus',
+          'video/webm;codecs=vp8,opus',
+          'video/webm',
+        ];
+        const mime = mimeCandidates.find((type) => MediaRecorder.isTypeSupported(type)) || '';
+        const recorderOptions = {
+          videoBitsPerSecond: profile.exportBitrate,
+          audioBitsPerSecond: profile.audioBitrate || 192_000,
+        };
+        if (mime) recorderOptions.mimeType = mime;
+        rec = new MediaRecorder(combinedStream, recorderOptions);
+        outputMime = rec.mimeType || mime || 'video/webm';
+        outputExtension = outputMime.includes('mp4') ? 'mp4' : 'webm';
+        rec.ondataavailable = (event) => { if (event.data?.size) chunks.push(event.data); };
+        donePromise = new Promise((resolve) => { rec.onstop = resolve; });
+
+        // Draw frame zero before recording. The AudioContext clock is the master export clock
+        // for both the audio buffer and the source-time used for captions/scene transitions.
+        renderFrameToContext(ctx, 0, canvas.width, canvas.height, exportBitmaps);
+        await recAudioCtx.resume();
+        const audioStartContextTime = recAudioCtx.currentTime;
+        rec.start();
+        recorderStarted = true;
+        audioSrc.start(audioStartContextTime);
+        if (manualFrameCapture) videoTrack.requestFrame();
+
+        const fps = profile.exportFps;
+        const totalFrames = Math.max(1, Math.ceil(outDur * fps));
+        let lastRenderedFrame = 0;
+        let lastProgressUpdate = 0;
+
         while (true) {
-          if (state.exportCancelled) { rec.stop(); audioSrc.stop(); throw new Error('Export cancelled'); }
-          const elapsed = (performance.now() - startPerf) / 1000;
+          if (state.exportCancelled) throw new Error('Export cancelled');
+          const elapsed = Math.max(0, recAudioCtx.currentTime - audioStartContextTime);
           if (elapsed >= outDur) break;
-          renderFrameToContext(ctx, elapsed * speed, canvas.width, canvas.height, exportBitmaps);
-          updateProcessMenu(15 + Math.round((elapsed / outDur) * 80), `Recording ${profile.name} · ${elapsed.toFixed(1)}s / ${outDur.toFixed(1)}s...`, steps);
-          await new Promise((r) => setTimeout(r, Math.max(1, Math.round(1000 / profile.exportFps))));
+
+          const frameIndex = Math.min(totalFrames - 1, Math.floor(elapsed * fps));
+          if (frameIndex > lastRenderedFrame) {
+            const outputTime = frameIndex / fps;
+            const sourceTime = Math.min(getTotalDuration(), outputTime * speed);
+            renderFrameToContext(ctx, sourceTime, canvas.width, canvas.height, exportBitmaps);
+            if (manualFrameCapture) videoTrack.requestFrame();
+            lastRenderedFrame = frameIndex;
+          }
+
+          const now = performance.now();
+          if (now - lastProgressUpdate > 120) {
+            lastProgressUpdate = now;
+            const progress = Math.min(95, 15 + Math.round((elapsed / outDur) * 80));
+            updateProcessMenu(progress, `Recording ${profile.name} · ${elapsed.toFixed(1)}s / ${outDur.toFixed(1)}s...`, steps);
+          }
+          await new Promise((resolve) => requestAnimationFrame(resolve));
         }
+
+        // Capture the final display frame so the video does not end one frame early.
+        if (lastRenderedFrame < totalFrames - 1) {
+          const finalTime = (totalFrames - 1) / fps;
+          renderFrameToContext(ctx, Math.min(getTotalDuration(), finalTime * speed), canvas.width, canvas.height, exportBitmaps);
+          if (manualFrameCapture) videoTrack.requestFrame();
+        }
+        await new Promise((resolve) => setTimeout(resolve, 40));
       } finally {
-        try { audioSrc.stop(); } catch {}
-        if (rec.state !== 'inactive') rec.stop();
-        await donePromise;
+        try { if (audioSrc) audioSrc.stop(); } catch {}
+        if (recorderStarted && rec && rec.state !== 'inactive') rec.stop();
+        if (recorderStarted && donePromise) await donePromise;
         await recAudioCtx.close().catch(() => {});
+        for (const track of videoStream.getTracks()) { try { track.stop(); } catch {} }
       }
 
       steps[1].done = true; steps[1].active = false; steps[2].active = true;
       updateProcessMenu(98, `Saving ${profile.name} ${outputExtension.toUpperCase()} video...`, steps);
-      triggerDownload(new Blob(chunks, { type: outputMime }), `stickman_studio_${Date.now()}.${outputExtension}`);
+      triggerDownload(new Blob(chunks, { type: outputMime || 'video/webm' }), `stickman_studio_${Date.now()}.${outputExtension}`);
       steps[2].done = true; steps[2].active = false;
       updateProcessMenu(100, 'Video downloaded!', steps);
       setTimeout(() => closeProcessMenu(), 500);
-      showToast(`${profile.name} video exported with audio (${outputExtension.toUpperCase()} fallback).`, 'success');
+      showToast(`${profile.name} video exported with synchronized audio (${outputExtension.toUpperCase()} fallback).`, 'success');
     }
 
     // =========================================================================
