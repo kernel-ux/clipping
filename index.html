@@ -74,11 +74,16 @@
           <span id="saveStatusText">Saved Locally</span>
         </button>
 
-        <select id="perfTierSelect" class="rounded-xl border border-zinc-800 bg-zinc-900 px-2.5 py-1.5 text-xs font-medium text-zinc-300 focus:border-yellow-400 focus:outline-none" title="Device performance tier">
-          <option value="auto">Auto Perf</option>
-          <option value="high">High (720p/60)</option>
-          <option value="balanced">Balanced (540p/30)</option>
-          <option value="lite">Lite (360p/24)</option>
+        <select id="perfTierSelect" class="rounded-xl border border-zinc-800 bg-zinc-900 px-2.5 py-1.5 text-xs font-medium text-zinc-300 transition-colors hover:border-zinc-600 focus:border-yellow-400 focus:outline-none" title="Preview performance only. This does not reduce export resolution.">
+          <option value="auto">Auto Preview</option>
+          <option value="high">High Preview (720p/60)</option>
+          <option value="balanced">Balanced Preview (540p/30)</option>
+          <option value="lite">Lite Preview (360p/24)</option>
+        </select>
+
+        <select id="exportQualitySelect" class="rounded-xl border border-yellow-400/40 bg-zinc-900 px-2.5 py-1.5 text-xs font-bold text-yellow-200 transition-colors hover:border-yellow-300 focus:border-yellow-400 focus:outline-none" title="Final video resolution and quality. 1080p is Full HD portrait (1080 × 1920).">
+          <option value="1080" selected>Export 1080p</option>
+          <option value="720">Export 720p</option>
         </select>
 
         <button id="loadDemoBtn" type="button" class="rounded-xl border border-zinc-800 bg-zinc-900 px-3 py-1.5 text-xs font-semibold text-zinc-200 transition hover:border-zinc-700 hover:bg-zinc-800">
@@ -515,6 +520,7 @@
       saveDot: document.getElementById('saveDot'),
       saveStatusText: document.getElementById('saveStatusText'),
       perfTierSelect: document.getElementById('perfTierSelect'),
+      exportQualitySelect: document.getElementById('exportQualitySelect'),
       loadDemoBtn: document.getElementById('loadDemoBtn'),
       clearProjectBtn: document.getElementById('clearProjectBtn'),
       exportMp4Btn: document.getElementById('exportMp4Btn'),
@@ -662,6 +668,7 @@
       uploadOrderMode: 'smart',
       scriptSplitMode: 'auto',
       perfTier: 'auto',
+      exportQuality: '1080',
       respectScriptTimeline: false,
       activeLeftTab: 'scenes',
       activeRightTab: 'cuts',
@@ -676,6 +683,15 @@
       captionLayoutCache: new Map(),
       exportCancelled: false,
     };
+
+    // If the hosted Inter font finishes loading after the first caption render,
+    // discard any fallback-font measurements so caption wrapping stays exact.
+    if (document.fonts?.ready) {
+      document.fonts.ready.then(() => {
+        state.captionLayoutCache.clear();
+        if (state.images.length && !state.isPlaying) renderPreviewFrame(state.currentTime, false);
+      }).catch(() => {});
+    }
 
     let rafPlaybackId = null;
     let playAnchorPerfTime = 0;
@@ -774,6 +790,27 @@
         return { name: 'lite', previewW: 360, previewH: 640, previewFps: 24, exportW: 540, exportH: 960, exportFps: 24, exportBitrate: 2_800_000 };
       }
       return { name: 'balanced', previewW: 540, previewH: 960, previewFps: 30, exportW: 720, exportH: 1280, exportFps: 30, exportBitrate: 4_200_000 };
+    }
+
+    // Export quality is deliberately independent from preview performance.
+    // Auto/Lite preview modes must never silently lower the downloaded video resolution.
+    function resolveExportProfile() {
+      if (state.exportQuality === '720') {
+        return {
+          name: '720p HD',
+          exportW: 720,
+          exportH: 1280,
+          exportFps: 30,
+          exportBitrate: 6_000_000,
+        };
+      }
+      return {
+        name: '1080p Full HD',
+        exportW: 1080,
+        exportH: 1920,
+        exportFps: 30,
+        exportBitrate: 10_000_000,
+      };
     }
 
     function applyPreviewCanvasResolution() {
@@ -930,6 +967,7 @@
           uploadOrderMode: state.uploadOrderMode,
           scriptSplitMode: state.scriptSplitMode,
           perfTier: state.perfTier,
+          exportQuality: state.exportQuality,
           respectScriptTimeline: state.respectScriptTimeline,
           nextUploadSeq: state.nextUploadSeq,
           hasWhisperWords: state.hasWhisperWords,
@@ -997,6 +1035,7 @@
         state.uploadOrderMode = saved.uploadOrderMode || 'smart';
         state.scriptSplitMode = saved.scriptSplitMode || 'auto';
         state.perfTier = saved.perfTier || 'auto';
+        state.exportQuality = saved.exportQuality === '720' ? '720' : '1080';
         state.respectScriptTimeline = saved.respectScriptTimeline === true;
         state.nextUploadSeq = saved.nextUploadSeq || 1;
         state.hasWhisperWords = !!saved.hasWhisperWords;
@@ -1022,6 +1061,7 @@
         el.uploadOrderSelect.value = state.uploadOrderMode;
         if (el.scriptSplitModeSelect) el.scriptSplitModeSelect.value = state.scriptSplitMode;
         el.perfTierSelect.value = state.perfTier;
+        el.exportQualitySelect.value = state.exportQuality;
         if (el.respectTimelineCheck) el.respectTimelineCheck.checked = state.respectScriptTimeline;
 
         if (Array.isArray(saved.imagesMeta) && saved.imagesMeta.length) {
@@ -3428,6 +3468,7 @@
           ? `${state.lastSyncMode} · ${state.images.length} scenes`
           : 'Ready to sync';
       }
+      state.captionLayoutCache.clear();
     }
 
     function runInstantPauseSync(showFeedback = true) {
@@ -3448,6 +3489,7 @@
         } else {
           state.captions = buildCaptionChunksFromScenes(state.images, state.speechSegments);
         }
+        state.captionLayoutCache.clear();
       }
 
       el.whisperStatusText.textContent = `Pause Sync · ${state.images.length} scenes`;
@@ -3840,6 +3882,7 @@
           computeSceneBreathWindows(state.images, words, state.voiceover.pcm16k, state.voiceover.duration);
         }
         state.captions = buildSceneAwareCaptionChunks(words, state.images, 4);
+        state.captionLayoutCache.clear();
 
         el.whisperStatusText.textContent = `${state.lastSyncMode} · ${words.length} words`;
         steps[2].done = true; steps[2].active = false;
@@ -3934,68 +3977,92 @@
 
     function renderCaptionOnCanvas(ctx, t, w, h) {
       if (state.captionStyle === 'off' || !state.captions.length) return;
-      let activeCap = null;
-      for (let i = 0; i < state.captions.length; i++) {
-        const c = state.captions[i];
-        if (t >= c.start - 0.02 && t <= c.end + 0.04) {
-          activeCap = c;
-          break;
-        }
+
+      // Captions are chronological. Find the most recent caption start instead of
+      // scanning every caption on every preview/export frame.
+      let capLo = 0;
+      let capHi = state.captions.length;
+      const captionLead = 0.02;
+      while (capLo < capHi) {
+        const mid = (capLo + capHi) >>> 1;
+        if (state.captions[mid].start <= t + captionLead) capLo = mid + 1;
+        else capHi = mid;
       }
-      if (!activeCap || !activeCap.words?.length) return;
+      const activeCap = state.captions[capLo - 1];
+      if (!activeCap || t < activeCap.start - captionLead || t > activeCap.end + 0.04 || !activeCap.words?.length) return;
 
       const words = activeCap.words;
-      let activeWordIdx = -1;
-      for (let i = 0; i < words.length; i++) {
-        if (t >= words[i].start - 0.015 && t <= words[i].end + 0.025) {
-          activeWordIdx = i;
-          break;
-        }
+
+      // Switch on the next word's actual start (with only a tiny 8 ms lead).
+      // The previous implementation kept the old word active for an extra 25 ms,
+      // while also starting the next word 15 ms early, creating a visibly late,
+      // overlapping marker window. Binary search keeps the highlight deterministic.
+      let wordLo = 0;
+      let wordHi = words.length;
+      const wordSwitchLead = 0.008;
+      while (wordLo < wordHi) {
+        const mid = (wordLo + wordHi) >>> 1;
+        if (words[mid].start <= t + wordSwitchLead) wordLo = mid + 1;
+        else wordHi = mid;
       }
-      if (activeWordIdx === -1) {
-        for (let i = words.length - 1; i >= 0; i--) {
-          if (t >= words[i].start) { activeWordIdx = i; break; }
-        }
-      }
-      if (activeWordIdx === -1) activeWordIdx = 0;
+      const activeWordIdx = Math.max(0, wordLo - 1);
 
       const fontSize = Math.round(w * 0.068);
       const lineHeight = Math.round(fontSize * 1.32);
       const spaceW = Math.round(fontSize * 0.30);
-      const maxLineW = w * 0.86;
+      const layoutSignature = `${w}|${fontSize}|${state.captionStyle}|${words.map((word) => String(word.text ?? '')).join('\u001f')}`;
+      let layout = state.captionLayoutCache.get(activeCap);
+
+      // Text wrapping and measureText are static for a caption at a given output
+      // size. Cache them once, then only redraw the active-word marker per frame.
+      if (!layout || layout.signature !== layoutSignature) {
+        ctx.save();
+        ctx.font = `900 ${fontSize}px Inter, system-ui, sans-serif`;
+        const maxLineW = w * 0.86;
+        const lines = [];
+        let curLine = [];
+        let curW = 0;
+        for (let i = 0; i < words.length; i++) {
+          const display = String(words[i].text ?? '').toUpperCase();
+          const measuredW = ctx.measureText(display).width;
+          const addW = curLine.length ? spaceW + measuredW : measuredW;
+          if (curLine.length && curW + addW > maxLineW) {
+            lines.push({ items: curLine, width: curW });
+            curLine = [{ text: display, width: measuredW, idx: i }];
+            curW = measuredW;
+          } else {
+            curLine.push({ text: display, width: measuredW, idx: i });
+            curW += addW;
+          }
+        }
+        if (curLine.length) lines.push({ items: curLine, width: curW });
+        const maxW = lines.length ? Math.max(...lines.map((line) => line.width)) : 0;
+        layout = {
+          signature: layoutSignature,
+          lines,
+          maxW,
+          fontSize,
+          lineHeight,
+          spaceW,
+          padX: Math.round(fontSize * 0.45),
+          padY: Math.round(fontSize * 0.30),
+        };
+        state.captionLayoutCache.set(activeCap, layout);
+        ctx.restore();
+      }
+
+      const { lines, maxW, padX, padY } = layout;
+      if (!lines.length) return;
+      const totalBlockH = lines.length * lineHeight;
+      const centerY = h * ((state.captionYPercent || 78) / 100);
+      const startY = centerY - totalBlockH * 0.5 + lineHeight * 0.5;
 
       ctx.save();
       ctx.font = `900 ${fontSize}px Inter, system-ui, sans-serif`;
       ctx.textBaseline = 'middle';
       ctx.textAlign = 'left';
 
-      // Wrap words cleanly into 1–2 balanced lines
-      const lines = [];
-      let curLine = [];
-      let curW = 0;
-      for (let i = 0; i < words.length; i++) {
-        const display = words[i].text.toUpperCase();
-        const mw = ctx.measureText(display).width;
-        const addW = curLine.length ? spaceW + mw : mw;
-        if (curLine.length && curW + addW > maxLineW) {
-          lines.push({ items: curLine, width: curW });
-          curLine = [{ text: display, width: mw, idx: i }];
-          curW = mw;
-        } else {
-          curLine.push({ text: display, width: mw, idx: i });
-          curW += addW;
-        }
-      }
-      if (curLine.length) lines.push({ items: curLine, width: curW });
-
-      const totalBlockH = lines.length * lineHeight;
-      const centerY = h * ((state.captionYPercent || 78) / 100);
-      const startY = centerY - totalBlockH * 0.5 + lineHeight * 0.5;
-
       if (state.captionStyle === 'minimal-box') {
-        const maxW = Math.max(...lines.map((l) => l.width));
-        const padX = Math.round(fontSize * 0.45);
-        const padY = Math.round(fontSize * 0.30);
         ctx.fillStyle = 'rgba(9, 9, 11, 0.78)';
         drawRoundedRect(ctx, (w - maxW) * 0.5 - padX, centerY - totalBlockH * 0.5 - padY, maxW + padX * 2, totalBlockH + padY * 2, Math.round(fontSize * 0.32));
         ctx.fill();
@@ -4577,7 +4644,7 @@
       pausePlayback();
       state.exportCancelled = false;
 
-      const profile = resolvePerfProfile();
+      const profile = resolveExportProfile();
       const speed = state.playbackSpeed || 1.15;
       const srcDur = getTotalDuration();
       const outDur = srcDur / speed;
@@ -4585,11 +4652,11 @@
       const totalFrames = Math.max(1, Math.ceil(outDur * fps));
 
       const steps = [
-        { label: `Prepare ${profile.exportW}×${profile.exportH} @ ${fps}fps frames`, active: true, done: false },
+        { label: `Prepare ${profile.name} (${profile.exportW}×${profile.exportH}) @ ${fps}fps`, active: true, done: false },
         { label: `Encode video + pitch-safe ${speed}x voice audio`, active: false, done: false },
         { label: 'Finalize & download video', active: false, done: false },
       ];
-      openProcessMenu('Exporting 9:16 Video', 'Checking hardware encoder...', true);
+      openProcessMenu(`Exporting ${profile.name} Video`, 'Checking high-quality encoder...', true);
       updateProcessMenu(3, 'Preparing high-res assets...', steps);
 
       const exportBitmaps = new Map();
@@ -4604,18 +4671,28 @@
 
         let chosenVideoConfig = null;
         if (hasWebCodecs && muxerMod) {
+          const level = profile.exportW === 1080 ? '0028' : '001f';
           const candidates = [
-            { codec: 'avc1.640028', width: profile.exportW, height: profile.exportH, bitrate: profile.exportBitrate },
-            { codec: 'avc1.4d0028', width: profile.exportW, height: profile.exportH, bitrate: profile.exportBitrate },
-            { codec: 'avc1.42001f', width: 720, height: 1280, bitrate: 3_500_000 },
+            { codec: `avc1.6400${level}`, width: profile.exportW, height: profile.exportH, bitrate: profile.exportBitrate, hardwareAcceleration: 'prefer-hardware' },
+            { codec: `avc1.4d00${level}`, width: profile.exportW, height: profile.exportH, bitrate: profile.exportBitrate, hardwareAcceleration: 'prefer-hardware' },
+            { codec: `avc1.4200${level}`, width: profile.exportW, height: profile.exportH, bitrate: profile.exportBitrate, hardwareAcceleration: 'prefer-hardware' },
+            { codec: `avc1.6400${level}`, width: profile.exportW, height: profile.exportH, bitrate: profile.exportBitrate },
+            { codec: `avc1.4d00${level}`, width: profile.exportW, height: profile.exportH, bitrate: profile.exportBitrate },
+            { codec: `avc1.4200${level}`, width: profile.exportW, height: profile.exportH, bitrate: profile.exportBitrate },
           ];
           for (const c of candidates) {
             try {
-              const sup = await VideoEncoder.isConfigSupported({
-                codec: c.codec, width: c.width, height: c.height, bitrate: c.bitrate, framerate: fps, hardwareAcceleration: 'prefer-hardware',
-              });
+              const config = {
+                codec: c.codec,
+                width: c.width,
+                height: c.height,
+                bitrate: c.bitrate,
+                framerate: fps,
+                ...(c.hardwareAcceleration ? { hardwareAcceleration: c.hardwareAcceleration } : {}),
+              };
+              const sup = await VideoEncoder.isConfigSupported(config);
               if (sup?.supported) {
-                chosenVideoConfig = { ...c, framerate: fps, hardwareAcceleration: 'prefer-hardware' };
+                chosenVideoConfig = config;
                 break;
               }
             } catch {}
@@ -4645,7 +4722,14 @@
             output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
             error: (e) => console.error('VideoEncoder error:', e),
           });
-          videoEncoder.configure(chosenVideoConfig);
+          try {
+            videoEncoder.configure(chosenVideoConfig);
+          } catch (configureError) {
+            console.warn('Selected-resolution MP4 encoder unavailable; using same-resolution recorder fallback:', configureError);
+            try { videoEncoder.close(); } catch {}
+            await exportWithAudioMediaRecorderFallback(exportBitmaps, outDur, speed, steps, profile);
+            return;
+          }
 
           if (canEncodeAac) {
             const mixed = await buildMixedExportAudioBuffer(speed);
@@ -4676,6 +4760,8 @@
           expCanvas.width = chosenVideoConfig.width;
           expCanvas.height = chosenVideoConfig.height;
           const expCtx = expCanvas.getContext('2d', { alpha: false });
+          expCtx.imageSmoothingEnabled = true;
+          expCtx.imageSmoothingQuality = 'high';
           let lastUiPerf = performance.now();
 
           for (let f = 0; f < totalFrames; f++) {
@@ -4715,7 +4801,7 @@
           setTimeout(() => closeProcessMenu(), 500);
           showToast('MP4 video exported with voice audio!', 'success');
         } else {
-          await exportWithAudioMediaRecorderFallback(exportBitmaps, outDur, speed, steps);
+          await exportWithAudioMediaRecorderFallback(exportBitmaps, outDur, speed, steps, profile);
         }
       } catch (err) {
         if (err?.message === 'Export cancelled') showToast('Export cancelled.');
@@ -4727,15 +4813,17 @@
       }
     }
 
-    async function exportWithAudioMediaRecorderFallback(exportBitmaps, outDur, speed, steps) {
+    async function exportWithAudioMediaRecorderFallback(exportBitmaps, outDur, speed, steps, profile = resolveExportProfile()) {
       steps[0].done = true; steps[0].active = false; steps[1].active = true;
-      updateProcessMenu(12, 'Mixing pitch-safe audio stream...', steps);
+      updateProcessMenu(12, `Preparing ${profile.name} recording and pitch-safe audio...`, steps);
 
       const canvas = document.createElement('canvas');
-      canvas.width = 720;
-      canvas.height = 1280;
+      canvas.width = profile.exportW;
+      canvas.height = profile.exportH;
       const ctx = canvas.getContext('2d', { alpha: false });
-      const videoStream = canvas.captureStream(30);
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'high';
+      const videoStream = canvas.captureStream(profile.exportFps);
 
       const Ctx = window.AudioContext || window.webkitAudioContext;
       const recAudioCtx = new Ctx({ sampleRate: 48000 });
@@ -4754,13 +4842,26 @@
         ...dest.stream.getAudioTracks(),
       ]);
 
-      const mime = MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')
-        ? 'video/webm;codecs=vp9,opus'
-        : MediaRecorder.isTypeSupported('video/webm;codecs=vp8,opus')
-          ? 'video/webm;codecs=vp8,opus'
-          : 'video/webm';
-
-      const rec = new MediaRecorder(combinedStream, { mimeType: mime, videoBitsPerSecond: 4_200_000 });
+      // Prefer MP4 when the browser's MediaRecorder supports it; otherwise use
+      // the best supported WebM codec. The file extension always follows the
+      // actual recorder output instead of pretending WebM is MP4.
+      const mimeCandidates = [
+        'video/mp4;codecs=avc1.640028,mp4a.40.2',
+        'video/mp4;codecs=avc1.4d0028,mp4a.40.2',
+        'video/mp4',
+        'video/webm;codecs=vp9,opus',
+        'video/webm;codecs=vp8,opus',
+        'video/webm',
+      ];
+      const mime = mimeCandidates.find((type) => MediaRecorder.isTypeSupported(type)) || '';
+      const recorderOptions = {
+        videoBitsPerSecond: profile.exportBitrate,
+        audioBitsPerSecond: 192_000,
+      };
+      if (mime) recorderOptions.mimeType = mime;
+      const rec = new MediaRecorder(combinedStream, recorderOptions);
+      const outputMime = rec.mimeType || mime || 'video/webm';
+      const outputExtension = outputMime.includes('mp4') ? 'mp4' : 'webm';
       const chunks = [];
       rec.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
       const donePromise = new Promise((resolve) => { rec.onstop = resolve; });
@@ -4776,8 +4877,8 @@
           const elapsed = (performance.now() - startPerf) / 1000;
           if (elapsed >= outDur) break;
           renderFrameToContext(ctx, elapsed * speed, canvas.width, canvas.height, exportBitmaps);
-          updateProcessMenu(15 + Math.round((elapsed / outDur) * 80), `Recording ${elapsed.toFixed(1)}s / ${outDur.toFixed(1)}s...`, steps);
-          await new Promise((r) => setTimeout(r, 30));
+          updateProcessMenu(15 + Math.round((elapsed / outDur) * 80), `Recording ${profile.name} · ${elapsed.toFixed(1)}s / ${outDur.toFixed(1)}s...`, steps);
+          await new Promise((r) => setTimeout(r, Math.max(1, Math.round(1000 / profile.exportFps))));
         }
       } finally {
         try { audioSrc.stop(); } catch {}
@@ -4787,12 +4888,12 @@
       }
 
       steps[1].done = true; steps[1].active = false; steps[2].active = true;
-      updateProcessMenu(98, 'Saving WebM video...', steps);
-      triggerDownload(new Blob(chunks, { type: mime }), `stickman_studio_${Date.now()}.webm`);
+      updateProcessMenu(98, `Saving ${profile.name} ${outputExtension.toUpperCase()} video...`, steps);
+      triggerDownload(new Blob(chunks, { type: outputMime }), `stickman_studio_${Date.now()}.${outputExtension}`);
       steps[2].done = true; steps[2].active = false;
       updateProcessMenu(100, 'Video downloaded!', steps);
       setTimeout(() => closeProcessMenu(), 500);
-      showToast('Video exported with audio!', 'success');
+      showToast(`${profile.name} video exported with audio (${outputExtension.toUpperCase()} fallback).`, 'success');
     }
 
     // =========================================================================
@@ -5251,6 +5352,11 @@
       renderPreviewFrame(state.currentTime);
       scheduleSaveProject();
     });
+    el.exportQualitySelect.addEventListener('change', () => {
+      state.exportQuality = el.exportQualitySelect.value === '720' ? '720' : '1080';
+      scheduleSaveProject();
+      showToast(`${resolveExportProfile().name} export selected. Preview performance is unchanged.`, 'success');
+    });
     el.loadDemoBtn.addEventListener('click', () => loadDemoProject());
     el.clearProjectBtn.addEventListener('click', () => resetProjectState(false));
     el.exportMp4Btn.addEventListener('click', () => exportMp4Video());
@@ -5674,6 +5780,7 @@
         computeSceneBreathWindows(state.images, state.rawWhisperWords, state.voiceover?.pcm16k, dur);
         if (!state.captionsManuallyEdited) {
           state.captions = buildSceneAwareCaptionChunks(state.rawWhisperWords, state.images, 4);
+          state.captionLayoutCache.clear();
         }
       } else {
         syncScenesToSpeechPauses(state.images, state.speechSegments, dur);
