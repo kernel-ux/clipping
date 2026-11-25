@@ -205,9 +205,10 @@
           Reset
         </button>
 
-        <select id="exportQualitySelect" class="rounded-xl border border-zinc-800 bg-zinc-900 px-2.5 py-1.5 text-xs font-semibold text-yellow-300 focus:border-yellow-400 focus:outline-none" title="Export resolution — 1080p is the sharpest">
-          <option value="auto" selected>Export · Auto Best (1080p)</option>
-          <option value="1080">Export 1080p · Full HD</option>
+        <select id="exportQualitySelect" class="rounded-xl border border-zinc-800 bg-zinc-900 px-2.5 py-1.5 text-xs font-semibold text-yellow-300 focus:border-yellow-400 focus:outline-none" title="Instagram Reels preset uses H.264 High + AAC 48kHz + 16 Mbps (under Meta's 25 Mbps cap)">
+          <option value="reels" selected>Export · Instagram Reels (1080p Best)</option>
+          <option value="1440">Export 1440p · Master 2K (Sharpest)</option>
+          <option value="1080">Export 1080p · Master Full HD</option>
           <option value="720">Export 720p · HD</option>
           <option value="540">Export 540p · Compact</option>
         </select>
@@ -343,6 +344,9 @@
             <button id="openGridModalBtn" type="button" class="rounded-xl border border-zinc-700 bg-zinc-900 px-2.5 py-1.5 text-xs font-semibold text-zinc-200 transition hover:border-zinc-500">
               Grid
             </button>
+            <button id="aiUpscaleScenesBtn" type="button" class="rounded-xl border border-yellow-400/45 bg-yellow-400/15 px-2.5 py-1.5 text-xs font-bold text-yellow-200 transition hover:bg-yellow-400/25" title="Free on-device ESRGAN 2× AI Upscaler + HD Crisp Lines for all low-res scenes">
+              ✨ AI 2× Enhance
+            </button>
           </div>
           <input id="imageUploadInput" type="file" accept="image/*" multiple class="hidden" />
           <input id="singleImageUploadInput" type="file" accept="image/*" class="hidden" />
@@ -472,11 +476,14 @@
             </select>
           </div>
           <div class="space-y-1.5">
-            <div class="flex items-center justify-between">
+            <div class="flex items-center justify-between gap-2">
               <span class="text-[11px] text-zinc-400">Vertical Caption Position (Y)</span>
-              <span id="captionYValue" class="font-mono text-[11px] font-bold text-yellow-300">78%</span>
+              <div class="flex items-center gap-1.5">
+                <button id="reelsSafeCaptionBtn" type="button" class="rounded-md border border-yellow-400/40 bg-yellow-400/15 px-1.5 py-0.5 text-[10px] font-bold text-yellow-200 hover:bg-yellow-400/25" title="Move captions above Instagram Reels bottom UI (64% Y)">IG Safe (64%)</button>
+                <span id="captionYValue" class="font-mono text-[11px] font-bold text-yellow-300">78%</span>
+              </div>
             </div>
-            <input id="captionYSlider" type="range" min="55" max="88" step="1" value="78" class="w-full" />
+            <input id="captionYSlider" type="range" min="50" max="88" step="1" value="78" class="w-full" />
           </div>
         </div>
       </div>
@@ -680,6 +687,7 @@
       singleImageUploadInput: document.getElementById('singleImageUploadInput'),
       pickOneByOneBtn: document.getElementById('pickOneByOneBtn'),
       openGridModalBtn: document.getElementById('openGridModalBtn'),
+      aiUpscaleScenesBtn: document.getElementById('aiUpscaleScenesBtn'),
       uploadOrderSelect: document.getElementById('uploadOrderSelect'),
       toggleTapOrderBtn: document.getElementById('toggleTapOrderBtn'),
       batchOrderBar: document.getElementById('batchOrderBar'),
@@ -797,7 +805,7 @@
       uploadOrderMode: 'smart',
       scriptSplitMode: 'auto',
       perfTier: 'auto',
-      exportQuality: 'auto',
+      exportQuality: 'reels',
       respectScriptTimeline: false,
       activeLeftTab: 'scenes',
       activeRightTab: 'cuts',
@@ -916,12 +924,14 @@
     // Export quality is its own setting now — it no longer depends on the preview "perf tier",
     // which is why exports on modest PCs / phones used to come out as 540p.
     const EXPORT_SPECS = {
-      '1080': { key: '1080', w: 1080, h: 1920, fps: 30, bitrate: 12_000_000, label: '1080p Full HD' },
-      '720': { key: '720', w: 720, h: 1280, fps: 30, bitrate: 5_500_000, label: '720p HD' },
-      '540': { key: '540', w: 540, h: 960, fps: 30, bitrate: 3_000_000, label: '540p' },
+      'reels': { key: 'reels', w: 1080, h: 1920, fps: 30, bitrate: 16_000_000, avcQp: 14, vp9Qp: 16, strictAvc: true, label: 'Instagram Reels 1080p' },
+      '1440': { key: '1440', w: 1440, h: 2560, fps: 30, bitrate: 28_000_000, avcQp: 10, vp9Qp: 12, label: '1440p Master 2K' },
+      '1080': { key: '1080', w: 1080, h: 1920, fps: 30, bitrate: 20_000_000, avcQp: 11, vp9Qp: 13, label: '1080p Master HD' },
+      '720': { key: '720', w: 720, h: 1280, fps: 30, bitrate: 10_000_000, avcQp: 14, vp9Qp: 16, label: '720p HD' },
+      '540': { key: '540', w: 540, h: 960, fps: 30, bitrate: 6_000_000, avcQp: 16, vp9Qp: 18, label: '540p' },
     };
-    EXPORT_SPECS.auto = { ...EXPORT_SPECS['1080'], key: 'auto', label: 'Auto Best' };
-    const EXPORT_LADDER = ['1080', '720', '540'];
+    EXPORT_SPECS.auto = { ...EXPORT_SPECS['reels'], key: 'auto', label: 'Instagram Reels 1080p' };
+    const EXPORT_LADDER = ['1440', '1080', '720', '540'];
 
     function resolveExportSpec(key = state.exportQuality) {
       return EXPORT_SPECS[key] || EXPORT_SPECS['1080'];
@@ -1155,7 +1165,7 @@
         state.scriptSplitMode = saved.scriptSplitMode || 'auto';
         state.perfTier = saved.perfTier || 'auto';
         state.exportQualityUser = saved.exportQualityUser === true;
-        state.exportQuality = (state.exportQualityUser && EXPORT_SPECS[saved.exportQuality]) ? saved.exportQuality : 'auto';
+        state.exportQuality = (state.exportQualityUser && EXPORT_SPECS[saved.exportQuality]) ? saved.exportQuality : 'reels';
         state.respectScriptTimeline = saved.respectScriptTimeline === true;
         state.nextUploadSeq = saved.nextUploadSeq || 1;
         state.hasWhisperWords = !!saved.hasWhisperWords;
@@ -1402,13 +1412,81 @@
       };
     }
 
+    // Estimate true SPOKEN duration weight of any token — fixes numbers/years ("1947" = "nineteen forty seven"),
+    // currency ("₹500", "$50"), percents ("100%"), decimals ("3.5"), resolutions ("1080p"), & acronyms ("AI", "MP4")
+    // so the yellow subtitle marker never rushes past numbers or drifts late!
+    function numberToSpokenWeight(numStr) {
+      const clean = String(numStr || '').replace(/,/g, '');
+      const n = parseInt(clean, 10);
+      if (!Number.isFinite(n)) return Math.max(4, clean.length * 4);
+      // 4-digit years like 1947 ("nineteen forty seven") or 2026 ("twenty twenty six")
+      if (clean.length === 4 && n >= 1100 && n <= 2099) {
+        const hi = Math.floor(n / 100);
+        const lo = n % 100;
+        const hiW = hi === 20 ? 6 : 8; // "twenty" vs "nineteen"
+        const loW = lo === 0 ? 7 : lo < 10 ? 7 : lo < 20 ? 8 : (lo % 10 === 0 ? 6 : 11);
+        return hiW + loW;
+      }
+      if (n === 0) return 5;
+      if (n < 10) return 4.5;
+      if (n < 20) return 7;
+      if (n < 100) return n % 10 === 0 ? 5.5 : 10;
+      if (n < 1000) return 11 + (n % 100 ? 7 : 0);
+      if (n < 1_000_000) return 14 + Math.min(10, clean.replace(/0/g, '').length * 3);
+      return 18 + Math.min(12, clean.length * 2);
+    }
+
+    function estimateSpokenWeight(word) {
+      const raw = String(word || '').trim();
+      if (!raw) return 2;
+      let w = 0;
+
+      // Spoken symbols: %, $, ₹, &, +, x (multiplier like 2x / 1.15x)
+      if (raw.includes('%')) w += 7; // "percent"
+      if (/[$₹€£]/.test(raw)) w += 6; // "dollars" / "rupees"
+      if (/[&+]/.test(raw)) w += 4;
+      if (/\d[xX]/.test(raw)) w += 5; // "times" / "x"
+      if (/\d+p/i.test(raw)) w += 3;  // "1080p"
+
+      // Extract numeric chunks (including decimals like 3.5 -> "three point five")
+      const strippedNums = raw.replace(/\d+(?:,\d{3})*(?:\.\d+)?/g, (m) => {
+        if (m.includes('.')) {
+          const [intPart, decPart] = m.split('.');
+          w += numberToSpokenWeight(intPart) + 5 + decPart.length * 4.5;
+        } else {
+          w += numberToSpokenWeight(m);
+        }
+        return ' ';
+      });
+
+      // Remaining alphabetic parts (acronyms like AI, USA, FPS are spelled letter-by-letter)
+      const alphaParts = strippedNums.replace(/[^a-zA-Z']/g, ' ').trim().split(/\s+/).filter(Boolean);
+      for (const part of alphaParts) {
+        const letters = part.replace(/'/g, '');
+        if (!letters) continue;
+        if (letters.length >= 2 && letters.length <= 4 && letters === letters.toUpperCase() && !/^(A|I|AN|IN|ON|AT|TO|OF|OR|IS|IT|BE|WE|HE|SO|NO|DO|GO|UP|BY|MY|IF|AS)$/.test(letters)) {
+          w += letters.length * 4.2;
+        } else {
+          // Vowel-group syllable hint blended with character length for natural English pacing
+          const syl = (letters.toLowerCase().replace(/(?:[^laeiouy]es|ed|[^laeiouy]e)$/, '').match(/[aeiouy]{1,2}/g) || []).length;
+          w += Math.max(2.2, letters.length * 0.65 + Math.max(1, syl) * 2.1);
+        }
+      }
+
+      // Natural micro-pause weight for trailing punctuation
+      if (/[.!?]["'”’)]*$/.test(raw)) w += 2.2;
+      else if (/[,;:—–]["'”’)]*$/.test(raw)) w += 1.2;
+
+      return Math.max(2.2, w);
+    }
+
     // Whisper DTW often stretches a single word's timestamp backwards/forwards across an adjacent pause.
     // Trim leading/trailing dead air from over-long word boxes to expose true spoken start/end & breath pauses!
     function trimWordToSpeechBounds(pcm, startSec, endSec, wordText, sampleRate = 16000) {
       if (!pcm || !pcm.length) return { start: startSec, end: endSec };
       const dur = endSec - startSec;
-      const cleanLen = String(wordText || '').replace(/[^a-z0-9]/gi, '').length;
-      const expectedMax = Math.max(0.32, cleanLen * 0.085);
+      const spokenLen = estimateSpokenWeight(wordText);
+      const expectedMax = Math.max(0.32, spokenLen * 0.085);
       if (dur <= expectedMax) return { start: startSec, end: endSec };
 
       const bounds = getSpeechBoundsInWindow(pcm, startSec, endSec, sampleRate);
@@ -1755,6 +1833,240 @@
       renderAllUI();
       renderPreviewFrame(state.currentTime);
       scheduleSaveProject();
+    }
+
+    // =========================================================================
+    // SECTION 5B: FREE TILED AI 2x UPSCALER (ESRGAN-SLIM) + HD CRISP LINES
+    // =========================================================================
+    let cachedUpscalerInstance = null;
+
+    function loadExternalScript(url) {
+      return new Promise((resolve, reject) => {
+        if (document.querySelector(`script[src="${url}"]`)) return resolve();
+        const s = document.createElement('script');
+        s.src = url;
+        s.async = true;
+        s.crossOrigin = 'anonymous';
+        s.onload = () => resolve();
+        s.onerror = () => reject(new Error(`Failed to load ${url}`));
+        document.head.appendChild(s);
+      });
+    }
+
+    async function getAiUpscaler(onStatus) {
+      if (cachedUpscalerInstance) return cachedUpscalerInstance;
+      onStatus('Loading free ESRGAN-Slim 2× AI model...');
+      await loadExternalScript('https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js');
+      await loadExternalScript('https://cdn.jsdelivr.net/npm/@upscalerjs/esrgan-slim@1.0.0/dist/umd/2x.min.js');
+      await loadExternalScript('https://cdn.jsdelivr.net/npm/upscaler@1.0.0-beta.19/dist/browser/umd/upscaler.min.js');
+
+      const UpscalerCtor = window.Upscaler;
+      const model2x = window.ESRGANSlim2x || window.DefaultUpscalerJSModel;
+      if (!UpscalerCtor || !model2x) {
+        throw new Error('UpscalerJS globals not available');
+      }
+      cachedUpscalerInstance = new UpscalerCtor({ model: model2x });
+      return cachedUpscalerInstance;
+    }
+
+    // Fast, clean Unsharp Mask pass on a canvas: makes 2D stickman outlines & text razor sharp
+    // without haloing flat backgrounds.
+    function applyCrispUnsharpMask(ctx, w, h, amount = 0.55) {
+      const imgData = ctx.getImageData(0, 0, w, h);
+      const src = imgData.data;
+      const out = new Uint8ClampedArray(src.length);
+      const row = w * 4;
+
+      // Copy borders untouched
+      out.set(src);
+
+      for (let y = 1; y < h - 1; y++) {
+        const yOff = y * row;
+        for (let x = 1; x < w - 1; x++) {
+          const i = yOff + x * 4;
+          for (let c = 0; c < 3; c++) {
+            const center = src[i + c];
+            const blur = (
+              src[i - row - 4 + c] + 2 * src[i - row + c] + src[i - row + 4 + c] +
+              2 * src[i - 4 + c]   + 4 * center           + 2 * src[i + 4 + c] +
+              src[i + row - 4 + c] + 2 * src[i + row + c] + src[i + row + 4 + c]
+            ) * 0.0625;
+            const diff = center - blur;
+            // Threshold of 3 avoids amplifying flat-background sensor noise
+            if (Math.abs(diff) > 3) {
+              const v = center + diff * amount;
+              out[i + c] = v < 0 ? 0 : v > 255 ? 255 : v;
+            } else {
+              out[i + c] = center;
+            }
+          }
+          out[i + 3] = src[i + 3];
+        }
+      }
+      imgData.data.set(out);
+      ctx.putImageData(imgData, 0, 0);
+    }
+
+    async function upscaleSingleSceneBlob(blob, upscaler, onPatchProgress) {
+      const rawBmp = await createImageBitmap(blob);
+      const origW = rawBmp.width;
+      const origH = rawBmp.height;
+
+      // If image is already >= 1080px wide or >= 1920px tall, just run crisp-line polish (no needless 4K bloat)
+      const needsAiScale = origW < 1040 && origH < 1850;
+
+      try {
+        if (needsAiScale && upscaler) {
+          // Prepare a clean input canvas capped at 720px max side so 2x output lands right around 1080–1440px
+          const maxIn = 760;
+          const preScale = Math.min(1, maxIn / Math.max(origW, origH));
+          const inW = Math.max(16, Math.round(origW * preScale));
+          const inH = Math.max(16, Math.round(origH * preScale));
+
+          const inCanvas = document.createElement('canvas');
+          inCanvas.width = inW;
+          inCanvas.height = inH;
+          const inCtx = inCanvas.getContext('2d', { alpha: false });
+          inCtx.imageSmoothingEnabled = true;
+          inCtx.imageSmoothingQuality = 'high';
+          inCtx.drawImage(rawBmp, 0, 0, inW, inH);
+
+          // Tiled inference (patchSize: 64, padding: 4) keeps GPU VRAM tiny so Chrome never crashes!
+          const dataUrl = await upscaler.upscale(inCanvas, {
+            output: 'base64',
+            patchSize: 64,
+            padding: 4,
+            progress: (pct) => { if (onPatchProgress) onPatchProgress(pct); },
+          });
+
+          const res = await fetch(dataUrl);
+          const upBlob = await res.blob();
+          const upBmp = await createImageBitmap(upBlob);
+
+          const outCanvas = document.createElement('canvas');
+          outCanvas.width = upBmp.width;
+          outCanvas.height = upBmp.height;
+          const outCtx = outCanvas.getContext('2d', { alpha: false });
+          outCtx.drawImage(upBmp, 0, 0);
+          upBmp.close();
+
+          // Subtle HD crisp-line finish on top of ESRGAN
+          applyCrispUnsharpMask(outCtx, outCanvas.width, outCanvas.height, 0.45);
+          const finalBlob = await new Promise((resolve) => outCanvas.toBlob((b) => resolve(b), 'image/png'));
+          return { blob: finalBlob, w: outCanvas.width, h: outCanvas.height, method: 'AI 2× ESRGAN' };
+        }
+
+        // High-res image or fallback: clean 2x target upscale (if small) + crisp unsharp mask
+        const targetScale = needsAiScale ? Math.min(2, 1080 / Math.max(1, origW)) : 1;
+        const outW = Math.round(origW * targetScale);
+        const outH = Math.round(origH * targetScale);
+        const outCanvas = document.createElement('canvas');
+        outCanvas.width = outW;
+        outCanvas.height = outH;
+        const outCtx = outCanvas.getContext('2d', { alpha: false });
+        outCtx.imageSmoothingEnabled = true;
+        outCtx.imageSmoothingQuality = 'high';
+        outCtx.drawImage(rawBmp, 0, 0, outW, outH);
+        applyCrispUnsharpMask(outCtx, outW, outH, 0.65);
+
+        const finalBlob = await new Promise((resolve) => outCanvas.toBlob((b) => resolve(b), 'image/png'));
+        return { blob: finalBlob, w: outW, h: outH, method: needsAiScale ? 'HD Sharpen 2×' : 'HD Crisp Polish' };
+      } finally {
+        rawBmp.close();
+      }
+    }
+
+    async function runAiEnhanceAllScenes() {
+      if (!state.images.length) {
+        showToast('Upload scene images first!', 'error');
+        return;
+      }
+      pausePlayback();
+      state.exportCancelled = false;
+
+      const steps = [
+        { label: 'Load free ESRGAN-Slim 2× AI model (cached in browser)', active: true, done: false },
+        { label: `Enhance ${state.images.length} scene image${state.images.length > 1 ? 's' : ''} (tiled, crash-safe)`, active: false, done: false },
+        { label: 'Save HD scenes & refresh 1080p preview', active: false, done: false },
+      ];
+      openProcessMenu('AI 2× Scene Enhancer', 'Starting free on-device AI upscaler...', true);
+      updateProcessMenu(4, 'Initializing...', steps);
+
+      let upscaler = null;
+      let usedFallback = false;
+      try {
+        upscaler = await getAiUpscaler((msg) => updateProcessMenu(10, msg, steps));
+      } catch (err) {
+        console.warn('ESRGAN CDN load failed, falling back to HD Sharpen:', err);
+        usedFallback = true;
+        showToast('AI model CDN unavailable — using instant HD Crisp Sharpen instead.');
+      }
+
+      steps[0].done = true; steps[0].active = false;
+      steps[1].active = true;
+
+      let enhancedCount = 0;
+      try {
+        for (let i = 0; i < state.images.length; i++) {
+          if (state.exportCancelled) throw new Error('Enhance cancelled');
+          const im = state.images[i];
+          const basePct = 15 + Math.round((i / state.images.length) * 78);
+          const spanPct = Math.max(1, Math.round(78 / state.images.length));
+
+          updateProcessMenu(basePct, `Enhancing Scene #${i + 1}/${state.images.length} (${im.name})...`, steps);
+          await yieldToUi();
+
+          const res = await upscaleSingleSceneBlob(im.blob, upscaler, (patchPct) => {
+            updateProcessMenu(
+              basePct + Math.round(patchPct * spanPct),
+              `AI Upscaling Scene #${i + 1}/${state.images.length} · ${Math.round(patchPct * 100)}%`,
+              steps
+            );
+          });
+
+          if (res?.blob) {
+            if (im.url) URL.revokeObjectURL(im.url);
+            im.blob = res.blob;
+            im.url = URL.createObjectURL(res.blob);
+            im.thumbUrl = await makeThumbnailDataUrl(res.blob);
+            // Force preview bitmap refresh for this scene
+            const oldBmp = state.previewBitmaps.get(im.id);
+            if (oldBmp) { try { oldBmp.close(); } catch {} state.previewBitmaps.delete(im.id); }
+            await saveMediaBlobToDB(im.id, res.blob, im.name);
+            enhancedCount++;
+          }
+          await yieldToUi();
+        }
+
+        steps[1].done = true; steps[1].active = false;
+        steps[2].active = true;
+        updateProcessMenu(96, 'Refreshing HD preview & saving...', steps);
+        await preloadBitmaps();
+        renderAllUI();
+        renderPreviewFrame(state.currentTime);
+        await saveProjectNow();
+
+        steps[2].done = true; steps[2].active = false;
+        updateProcessMenu(100, `Enhanced ${enhancedCount} scenes! Ready for crisp 1080p MP4 export.`, steps);
+        setTimeout(() => closeProcessMenu(), 600);
+        showToast(
+          usedFallback
+            ? `HD Sharpened ${enhancedCount} scenes! Export MP4 now.`
+            : `✨ AI 2× Enhanced ${enhancedCount} scenes! Export MP4 for full clarity.`,
+          'success'
+        );
+      } catch (err) {
+        closeProcessMenu();
+        if (err?.message === 'Enhance cancelled') {
+          await preloadBitmaps();
+          renderAllUI();
+          renderPreviewFrame(state.currentTime);
+          showToast(`Cancelled after enhancing ${enhancedCount} scene(s).`);
+        } else {
+          console.error('AI Enhance error:', err);
+          showToast(`Enhance error: ${err?.message || 'Unknown error'}`, 'error');
+        }
+      }
     }
 
     // =========================================================================
@@ -2741,7 +3053,7 @@
       const clean = wordTexts.map((t) => String(t || '').trim()).filter(Boolean);
       if (!clean.length) return [];
       const dur = Math.max(0.08, endSec - startSec);
-      const weights = clean.map((w) => Math.max(2, w.replace(/[^a-z0-9]/gi, '').length));
+      const weights = clean.map((w) => estimateSpokenWeight(w));
       const totalW = weights.reduce((a, b) => a + b, 0);
       let cursor = startSec;
       return clean.map((text, idx) => {
@@ -3858,7 +4170,7 @@
       }
 
       const totalSpeech = active.reduce((acc, g) => acc + (g.end - g.start), 0);
-      const wordWeights = words.map((w) => Math.max(2, w.replace(/[^a-z0-9]/gi, '').length));
+      const wordWeights = words.map((w) => estimateSpokenWeight(w));
       const totalWordW = wordWeights.reduce((a, b) => a + b, 0);
 
       const out = [];
@@ -4122,6 +4434,8 @@
         drawH = bmp.height * coverScale;
       }
 
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'high';
       ctx.translate(w * 0.5 + tx, h * 0.5 + ty);
       ctx.scale(kbScale, kbScale);
       ctx.drawImage(bmp, -drawW * 0.5, -drawH * 0.5, drawW, drawH);
@@ -4131,8 +4445,8 @@
     // ---- Subtitle marker engine ------------------------------------------------
     // Text is measured once per caption (not every frame) and the highlight is a pure function
     // of time, so the live preview and the exported video draw the exact same marker.
-    const CAPTION_MARKER_LEAD = 0.07;   // marker lands a hair BEFORE the word is heard, so it never feels late
-    const CAPTION_MARKER_GLIDE = 0.055;  // seconds the pill takes to slide onto the next word
+    const CAPTION_MARKER_LEAD = 0.025;  // gentle 25ms lead so the pill starts gliding right on the consonant
+    const CAPTION_MARKER_GLIDE = 0.045;  // crisp 45ms glide onto the spoken word
     const CAPTION_LATIN_PROBE = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
     const MARK_WHITE = [255, 255, 255];
     const MARK_INK = [9, 9, 11];
@@ -4221,13 +4535,16 @@
 
       // Active word = the LAST word that has started (plus a tiny lead). The old overlapping windows
       // kept the previous word lit for ~40ms after the next one began, which is what felt laggy.
-      const probe = t + CAPTION_MARKER_LEAD;
+      const spd = state.playbackSpeed || 1.0;
+      const lead = CAPTION_MARKER_LEAD * spd;
+      const glideDur = CAPTION_MARKER_GLIDE * spd;
+      const probe = t + lead;
       let activeWordIdx = 0;
       for (let i = 0; i < words.length; i++) {
         if (words[i].start <= probe) activeWordIdx = i;
         else break;
       }
-      const glide = easeOutCubic((t - (words[activeWordIdx].start - CAPTION_MARKER_LEAD)) / CAPTION_MARKER_GLIDE);
+      const glide = easeOutCubic((t - (words[activeWordIdx].start - lead)) / glideDur);
 
       const fontSize = Math.round(w * 0.068);
 
@@ -4295,13 +4612,13 @@
 
       for (let li = 0; li < lines.length; li++) {
         const line = lines[li];
-        const x0 = (w - line.width) * 0.5;
-        const y = startY + li * lineHeight;
+        const x0 = Math.round((w - line.width) * 0.5);
+        const y = Math.round(startY + li * lineHeight);
 
         for (const item of line.items) {
           // k = how "lit" this word is (0..1). Cross-fades with the pill so colours never pop.
           const k = item.idx === activeWordIdx ? glide : (item.idx === activeWordIdx - 1 ? 1 - glide : 0);
-          const x = x0 + item.dx;
+          const x = Math.round(x0 + item.dx);
 
           if (style === 'yellow-pill') {
             const strokeA = 0.92 * (1 - k);
@@ -4874,8 +5191,9 @@
       return null;
     }
 
-    // Downscale each scene ONCE with a high-quality filter to just above the size it is drawn at.
-    // Drawing a 4000px photo straight onto a 1080px canvas with the default filter is what made exports look soft/shimmery.
+    // Master-grade scene bitmap prep (runs once per scene in the 3-scene sliding window):
+    // 1. Fits cleanly to export resolution (no double-resampling blur, caps >2K photos at 1.5x).
+    // 2. Runs a subtle Crisp-Edge Unsharp Mask once per scene so stickman outlines & details pop at 1080p/1440p.
     async function createExportBitmap(blob, targetW, targetH) {
       const raw = await createImageBitmap(blob);
       try {
@@ -4884,53 +5202,174 @@
         const drawW = imgAspect > canvasAspect * 1.15
           ? targetW
           : raw.width * Math.max(targetW / raw.width, targetH / raw.height);
-        // Ken-Burns + transitions scale a layer up to ~1.15x, so keep 1.25x of the pixels it needs
-        const keep = Math.min(1, (drawW * 1.25) / raw.width);
-        if (keep >= 0.97) return raw;
-        const scaled = await createImageBitmap(raw, {
-          resizeWidth: Math.max(1, Math.round(raw.width * keep)),
-          resizeHeight: Math.max(1, Math.round(raw.height * keep)),
-          resizeQuality: 'high',
-        });
+
+        // Upscale small images cleanly to target drawW once, or cap huge photos at 1.5x drawW
+        let outW = raw.width;
+        let outH = raw.height;
+        if (raw.width < drawW * 0.98) {
+          const up = Math.min(2.0, (drawW * 1.08) / Math.max(1, raw.width));
+          outW = Math.max(1, Math.round(raw.width * up));
+          outH = Math.max(1, Math.round(raw.height * up));
+        } else if (raw.width > drawW * 1.8) {
+          const down = (drawW * 1.5) / raw.width;
+          outW = Math.max(1, Math.round(raw.width * down));
+          outH = Math.max(1, Math.round(raw.height * down));
+        }
+
+        const c = document.createElement('canvas');
+        c.width = outW;
+        c.height = outH;
+        const g = c.getContext('2d', { alpha: false, colorSpace: 'srgb' });
+        g.imageSmoothingEnabled = true;
+        g.imageSmoothingQuality = 'high';
+        g.drawImage(raw, 0, 0, outW, outH);
         raw.close();
-        return scaled;
+
+        // Subtle crisp-edge polish (stronger if source was upscaled, gentle if already high-res)
+        const sharpAmt = outW > raw.width ? 0.52 : 0.28;
+        applyCrispUnsharpMask(g, outW, outH, sharpAmt);
+
+        const bmp = await createImageBitmap(c);
+        c.width = 0; c.height = 0;
+        return bmp;
       } catch {
         return raw;
       }
     }
 
-    // Finds the best H.264 config this browser can really encode, for the chosen quality and every step below it.
+    // Strict backpressure waiter: NEVER lets raw 1080p VideoFrames pile up in GPU/shared memory (prevents OOM crashes!).
+    async function waitForEncoderQueue(encoder, maxQueue, getFailure) {
+      while (
+        encoder.state === 'configured' &&
+        encoder.encodeQueueSize >= maxQueue &&
+        !state.exportCancelled &&
+        !getFailure()
+      ) {
+        await new Promise((resolve) => {
+          let done = false;
+          const finish = () => {
+            if (done) return;
+            done = true;
+            if (encoder.ondequeue === finish) encoder.ondequeue = null;
+            resolve();
+          };
+          encoder.ondequeue = finish;
+          setTimeout(finish, 100);
+        });
+      }
+    }
+
+    // Keep at most 3 full-res scene bitmaps decoded in VRAM at any time (prev + current + next)
+    // and immediately .close() finished scenes so even 50+ scene projects stay under ~40 MB VRAM.
+    function findSceneIdxAtSourceTime(srcTimeSec) {
+      if (!state.images.length) return -1;
+      const total = getTotalDuration();
+      const syncT = Math.max(0, Math.min(total, srcTimeSec + (state.syncOffsetSec || 0)));
+      const sceneT = Math.max(0, Math.min(total, syncT + (state.imageOffsetSec || 0)));
+      for (let i = 0; i < state.images.length; i++) {
+        if (sceneT >= state.images[i].start && (i === state.images.length - 1 || sceneT < state.images[i].end)) {
+          return i;
+        }
+      }
+      return state.images.length - 1;
+    }
+
+    async function syncExportBitmapWindow(bitmapMap, centerIdx, targetW, targetH) {
+      const keepIds = new Set();
+      const lo = Math.max(0, centerIdx - 1);
+      const hi = Math.min(state.images.length - 1, centerIdx + 1);
+      for (let i = lo; i <= hi; i++) keepIds.add(state.images[i].id);
+
+      for (const [id, bmp] of bitmapMap.entries()) {
+        if (!keepIds.has(id)) {
+          try { bmp.close(); } catch {}
+          bitmapMap.delete(id);
+        }
+      }
+      for (let i = lo; i <= hi; i++) {
+        const im = state.images[i];
+        if (!bitmapMap.has(im.id)) {
+          bitmapMap.set(im.id, await createExportBitmap(im.blob, targetW, targetH));
+        }
+      }
+    }
+
+    // Finds the sharpest WebCodecs configs this browser can truly encode.
+    // Priority at each resolution (before ever dropping resolution):
+    //  1. True Constant-Quality Quantizer mode (H.264 QP 15-16 or VP9 QP 16-18) — bypasses blurry rate controllers!
+    //  2. High-bitrate H.264 CBR/VBR (Auto, then Software fallback) for universal MP4 compatibility.
     async function findEncoderConfigs(startKey) {
-      const ladder = EXPORT_LADDER.slice(Math.max(0, EXPORT_LADDER.indexOf(startKey)));
+      const isReels = startKey === 'reels' || startKey === 'auto';
+      const ladder = isReels
+        ? ['reels', '720', '540']
+        : EXPORT_LADDER.slice(Math.max(0, EXPORT_LADDER.indexOf(startKey)));
       const found = [];
+
       for (const key of ladder) {
         const spec = EXPORT_SPECS[key];
-        // High profile level 4.2 → 4.1 → 4.0 (4.2 gives 1080x1920 real headroom), then Main profile
-        const codecs = ['avc1.64002a', 'avc1.640029', 'avc1.640028', 'avc1.4d0028'];
-        if (spec.w <= 720) codecs.push('avc1.42001f');
-        for (const codec of codecs) {
-          try {
-            const config = {
-              codec,
-              width: spec.w,
-              height: spec.h,
-              bitrate: spec.bitrate,
-              framerate: spec.fps,
-              hardwareAcceleration: 'prefer-hardware',
-            };
-            const sup = await VideoEncoder.isConfigSupported(config);
-            if (sup?.supported) {
-              found.push({ spec, config });
-              break;
-            }
-          } catch {}
+        const avcCodecs = spec.w >= 1440
+          ? ['avc1.640033', 'avc1.640032', 'avc1.4d0033', 'avc1.4d0032']
+          : ['avc1.64002a', 'avc1.640029', 'avc1.640028', 'avc1.4d002a', 'avc1.4d0028', 'avc1.42002a'];
+        if (spec.w <= 720) avcCodecs.push('avc1.42001f');
+        const vp9Codecs = spec.w >= 1440
+          ? ['vp09.00.50.08', 'vp09.00.41.08']
+          : ['vp09.00.41.08', 'vp09.00.40.08'];
+
+        const seen = new Set();
+        const tryAdd = async (codecList, muxerCodec, bitrateMode, accel, tag) => {
+          for (const codec of codecList) {
+            try {
+              const config = {
+                codec,
+                width: spec.w,
+                height: spec.h,
+                framerate: spec.fps,
+                bitrateMode,
+                latencyMode: 'quality',
+                hardwareAcceleration: accel,
+              };
+              if (bitrateMode !== 'quantizer') config.bitrate = spec.bitrate;
+              const sup = await VideoEncoder.isConfigSupported(config);
+              if (sup?.supported) {
+                const finalCfg = sup.config ? { ...config, ...sup.config } : config;
+                const sig = `${finalCfg.width}x${finalCfg.height}|${finalCfg.codec}|${finalCfg.hardwareAcceleration}|${finalCfg.bitrateMode}`;
+                if (!seen.has(sig)) {
+                  seen.add(sig);
+                  found.push({ spec, config: finalCfg, muxerCodec, modeTag: tag });
+                }
+                return true;
+              }
+            } catch {}
+          }
+          return false;
+        };
+
+        if (spec.strictAvc) {
+          // Instagram Reels Optimal: strict H.264 High Profile MP4 (16 Mbps VBR/CBR under Meta's 25 Mbps cap — zero VP9 incompatibility)
+          await tryAdd(avcCodecs, 'avc', 'variable', 'no-preference', 'Reels H.264 VBR');
+          await tryAdd(avcCodecs, 'avc', 'constant', 'no-preference', 'Reels H.264 CBR');
+          await tryAdd(avcCodecs, 'avc', 'quantizer', 'no-preference', `Reels H.264 CQ${spec.avcQp}`);
+          await tryAdd(avcCodecs, 'avc', 'variable', 'prefer-software', 'Reels H.264 SW');
+          await tryAdd(avcCodecs, 'avc', 'constant', 'prefer-software', 'Reels H.264 SW CBR');
+        } else {
+          // 1. Constant-Quality H.264 (razor sharp & universally playable MP4)
+          await tryAdd(avcCodecs, 'avc', 'quantizer', 'no-preference', `H.264 CQ${spec.avcQp}`);
+          // 2. Constant-Quality VP9 in MP4 (ultra crisp 2D lines & text)
+          await tryAdd(vp9Codecs, 'vp9', 'quantizer', 'prefer-software', `VP9 CQ${spec.vp9Qp}`);
+          // 3. High-bitrate H.264 CBR/VBR fallbacks (Auto, then Software)
+          if (!(await tryAdd(avcCodecs, 'avc', 'constant', 'no-preference', 'H.264 Auto CBR'))) {
+            await tryAdd(avcCodecs, 'avc', 'variable', 'no-preference', 'H.264 Auto VBR');
+          }
+          if (!(await tryAdd(avcCodecs, 'avc', 'constant', 'prefer-software', 'H.264 SW CBR'))) {
+            await tryAdd(avcCodecs, 'avc', 'variable', 'prefer-software', 'H.264 SW VBR');
+          }
         }
       }
       return found;
     }
 
-    async function encodeMp4WithWebCodecs(muxerMod, cfg, mixed, speed, srcDur, steps) {
-      const { spec, config } = cfg;
+    async function encodeMp4WithWebCodecs(muxerMod, cfg, mixed, audioCodecCfg, speed, srcDur, steps) {
+      const { spec, config, muxerCodec = 'avc', modeTag } = cfg;
       const fps = spec.fps;
       const totalFrames = Math.max(1, Math.ceil((srcDur / speed) * fps));
 
@@ -4941,15 +5380,17 @@
 
       let encoderFailure = null;
       const asFailure = (e) => {
-        const err = new Error(`Video encoder failed at ${spec.label}${e?.message ? `: ${e.message}` : ''}`);
+        const err = new Error(`Video encoder failed at ${spec.label} (${modeTag})${e?.message ? `: ${e.message}` : ''}`);
         err.encoderFailure = true;
         return err;
       };
 
       const muxer = new muxerMod.Muxer({
         target: new muxerMod.ArrayBufferTarget(),
-        video: { codec: 'avc', width: config.width, height: config.height },
-        audio: mixed ? { codec: 'aac', numberOfChannels: 2, sampleRate: 48000 } : undefined,
+        video: { codec: muxerCodec, width: config.width, height: config.height },
+        audio: (mixed && audioCodecCfg)
+          ? { codec: audioCodecCfg.muxerCodec, numberOfChannels: 2, sampleRate: 48000 }
+          : undefined,
         fastStart: 'in-memory',
       });
 
@@ -4962,21 +5403,19 @@
       try {
         videoEncoder.configure(config);
 
-        updateProcessMenu(12, `Preparing ${spec.w}×${spec.h} scene images...`, steps);
-        for (const im of state.images) {
-          if (state.exportCancelled) throw new Error('Export cancelled');
-          exportBitmaps.set(im.id, await createExportBitmap(im.blob, config.width, config.height));
-        }
-
-        if (mixed) {
+        if (mixed && audioCodecCfg) {
+          updateProcessMenu(12, 'Encoding audio track...', steps);
+          let audioFailure = null;
           const audioEncoder = new AudioEncoder({
             output: (chunk, meta) => muxer.addAudioChunk(chunk, meta),
-            error: (e) => console.error('AudioEncoder error:', e),
+            error: (e) => { audioFailure = e; console.error('AudioEncoder error:', e); },
           });
-          audioEncoder.configure({ codec: 'mp4a.40.2', numberOfChannels: 2, sampleRate: 48000, bitrate: 128_000 });
+          audioEncoder.configure(audioCodecCfg.encoder);
 
           const chunkFrames = 4800;
           for (let off = 0; off < mixed.length; off += chunkFrames) {
+            if (state.exportCancelled) throw new Error('Export cancelled');
+            if (audioFailure) throw asFailure(audioFailure);
             const count = Math.min(chunkFrames, mixed.length - off);
             const planar = new Float32Array(count * 2);
             planar.set(mixed.left.subarray(off, off + count), 0);
@@ -4985,8 +5424,14 @@
               format: 'f32-planar', sampleRate: 48000, numberOfFrames: count, numberOfChannels: 2,
               timestamp: Math.round((off / 48000) * 1_000_000), data: planar,
             });
-            audioEncoder.encode(audioData);
-            audioData.close();
+            try {
+              audioEncoder.encode(audioData);
+            } finally {
+              audioData.close();
+            }
+            if (audioEncoder.encodeQueueSize >= 16) {
+              await waitForEncoderQueue(audioEncoder, 8, () => audioFailure);
+            }
           }
           await audioEncoder.flush();
           audioEncoder.close();
@@ -4995,12 +5440,14 @@
         const expCanvas = document.createElement('canvas');
         expCanvas.width = config.width;
         expCanvas.height = config.height;
-        const expCtx = expCanvas.getContext('2d', { alpha: false });
+        const expCtx = expCanvas.getContext('2d', { alpha: false, colorSpace: 'srgb' });
         expCtx.imageSmoothingEnabled = true;
         expCtx.imageSmoothingQuality = 'high';
 
         const startPerf = performance.now();
         let lastUiPerf = startPerf;
+        let prevActiveIdx = -1;
+        let lastWindowIdx = -2;
 
         for (let f = 0; f < totalFrames; f++) {
           if (state.exportCancelled) throw new Error('Export cancelled');
@@ -5008,30 +5455,51 @@
 
           const outTimeSec = f / fps;
           const srcTimeSec = Math.min(srcDur, outTimeSec * speed);
-          renderFrameToContext(expCtx, srcTimeSec, expCanvas.width, expCanvas.height, exportBitmaps);
+
+          // Stream only the active + adjacent scenes into VRAM (max 3 bitmaps at once)
+          const approxIdx = findSceneIdxAtSourceTime(srcTimeSec);
+          if (approxIdx !== lastWindowIdx) {
+            await syncExportBitmapWindow(exportBitmaps, approxIdx, config.width, config.height);
+            lastWindowIdx = approxIdx;
+          }
+
+          const activeIdx = renderFrameToContext(expCtx, srcTimeSec, expCanvas.width, expCanvas.height, exportBitmaps);
+          const sceneChanged = activeIdx !== prevActiveIdx;
+          prevActiveIdx = activeIdx;
+
+          // Wait for encoder queue BEFORE allocating a new VideoFrame so in-flight memory stays tiny
+          if (videoEncoder.encodeQueueSize >= 5) {
+            await waitForEncoderQueue(videoEncoder, 3, () => encoderFailure);
+          }
+          if (state.exportCancelled) throw new Error('Export cancelled');
+          if (encoderFailure) throw asFailure(encoderFailure);
+
+          // Force a crisp I-frame on frame 0, on every scene switch, and every 1 second
+          const isKeyFrame = f === 0 || sceneChanged || (f % fps === 0);
 
           const frame = new VideoFrame(expCanvas, {
             timestamp: Math.round(outTimeSec * 1_000_000),
             duration: Math.round((1 / fps) * 1_000_000),
           });
+          const encodeOpts = { keyFrame: isKeyFrame };
+          if (config.bitrateMode === 'quantizer') {
+            if (muxerCodec === 'vp9') encodeOpts.vp9 = { quantizer: spec.vp9Qp || 18 };
+            else encodeOpts.avc = { quantizer: spec.avcQp || 16 };
+          }
           try {
-            videoEncoder.encode(frame, { keyFrame: f % (fps * 2) === 0 });
+            videoEncoder.encode(frame, encodeOpts);
           } finally {
             frame.close();
           }
 
-          if (videoEncoder.encodeQueueSize > 8) {
-            await new Promise((r) => { videoEncoder.ondequeue = r; setTimeout(r, 15); });
-          }
-
           const now = performance.now();
-          if (now - lastUiPerf > 120) {
+          if (now - lastUiPerf > 75) {
             lastUiPerf = now;
             const done = f + 1;
-            const eta = done > 20 ? Math.ceil(((now - startPerf) / done) * (totalFrames - done) / 1000) : null;
+            const eta = done > 15 ? Math.ceil(((now - startPerf) / done) * (totalFrames - done) / 1000) : null;
             updateProcessMenu(
               15 + Math.round((f / totalFrames) * 80),
-              `Encoding frame ${done} / ${totalFrames} · ${spec.label}${eta !== null ? ` · about ${eta}s left` : ''}`,
+              `Encoding frame ${done} / ${totalFrames} · ${spec.label} (${modeTag})${eta !== null ? ` · ~${eta}s left` : ''}`,
               steps
             );
             await yieldToUi();
@@ -5046,7 +5514,6 @@
         return new Blob([muxer.target.buffer], { type: 'video/mp4' });
       } catch (err) {
         if (err?.message === 'Export cancelled' || err?.encoderFailure) throw err;
-        // A dead hardware encoder often surfaces as InvalidStateError on the next encode()/flush(), before its error callback fires
         if (encoderFailure || err?.name === 'InvalidStateError' || err?.name === 'EncodingError' || err?.name === 'NotSupportedError') {
           throw asFailure(encoderFailure || err);
         }
@@ -5073,11 +5540,11 @@
 
       const steps = [
         { label: `Prepare ${requested.w}×${requested.h} @ ${requested.fps}fps frames`, active: true, done: false },
-        { label: `Encode video + pitch-safe ${speed}x voice audio`, active: false, done: false },
+        { label: `Encode high-clarity video + pitch-safe ${speed}x audio`, active: false, done: false },
         { label: 'Finalize & download video', active: false, done: false },
       ];
-      openProcessMenu('Exporting 9:16 Video', 'Checking hardware encoder...', true);
-      updateProcessMenu(3, 'Preparing high-res assets...', steps);
+      openProcessMenu('Exporting 9:16 Video', 'Checking video encoder...', true);
+      updateProcessMenu(3, 'Preparing assets...', steps);
 
       try {
         await ensureCaptionFonts();
@@ -5086,22 +5553,30 @@
         const hasWebCodecs = typeof VideoEncoder !== 'undefined' && typeof VideoFrame !== 'undefined';
         const muxerMod = hasWebCodecs ? await loadMp4Muxer() : null;
 
-        let canEncodeAac = false;
+        // Try AAC first (universal MP4 compatibility), fall back to Opus in MP4 before ever dropping to MediaRecorder
+        let audioCodecCfg = null;
         if (hasAudioTrack && typeof AudioEncoder !== 'undefined' && typeof AudioData !== 'undefined') {
-          try {
-            const aSup = await AudioEncoder.isConfigSupported({ codec: 'mp4a.40.2', numberOfChannels: 2, sampleRate: 48000, bitrate: 128_000 });
-            canEncodeAac = !!aSup?.supported;
-          } catch {}
+          const audioCandidates = [
+            { muxerCodec: 'aac', encoder: { codec: 'mp4a.40.2', numberOfChannels: 2, sampleRate: 48000, bitrate: 256_000 } },
+            { muxerCodec: 'aac', encoder: { codec: 'mp4a.40.2', numberOfChannels: 2, sampleRate: 48000, bitrate: 192_000 } },
+            { muxerCodec: 'opus', encoder: { codec: 'opus', numberOfChannels: 2, sampleRate: 48000, bitrate: 160_000 } },
+          ];
+          for (const cand of audioCandidates) {
+            try {
+              const aSup = await AudioEncoder.isConfigSupported(cand.encoder);
+              if (aSup?.supported) { audioCodecCfg = cand; break; }
+            } catch {}
+          }
         }
 
-        const configs = (hasWebCodecs && muxerMod && (!hasAudioTrack || canEncodeAac))
+        const configs = (hasWebCodecs && muxerMod && (!hasAudioTrack || !!audioCodecCfg))
           ? await findEncoderConfigs(requested.key)
           : [];
 
         let finished = false;
         if (configs.length) {
           let mixed = null;
-          if (canEncodeAac) {
+          if (hasAudioTrack && audioCodecCfg) {
             updateProcessMenu(10, 'Mixing pitch-preserved voice audio...', steps);
             mixed = await buildMixedExportAudioBuffer(speed);
           }
@@ -5109,27 +5584,31 @@
           let result = null;
           for (let i = 0; i < configs.length; i++) {
             try {
-              const blob = await encodeMp4WithWebCodecs(muxerMod, configs[i], mixed, speed, srcDur, steps);
-              result = { blob, spec: configs[i].spec };
+              const blob = await encodeMp4WithWebCodecs(muxerMod, configs[i], mixed, audioCodecCfg, speed, srcDur, steps);
+              result = { blob, spec: configs[i].spec, modeTag: configs[i].modeTag };
               break;
             } catch (err) {
               if (err?.message === 'Export cancelled' || !err?.encoderFailure) throw err;
               console.warn(err.message);
-              if (i + 1 < configs.length) showToast(`${configs[i].spec.label} encoder failed — retrying at ${configs[i + 1].spec.label}...`);
+              if (i + 1 < configs.length) {
+                showToast(`${configs[i].spec.label} (${configs[i].modeTag}) failed — retrying with ${configs[i + 1].spec.label} (${configs[i + 1].modeTag})...`);
+              }
             }
           }
 
           if (result) {
+            const realMbps = ((result.blob.size * 8) / Math.max(0.1, outDur) / 1_000_000).toFixed(1);
+            const sizeMb = (result.blob.size / (1024 * 1024)).toFixed(1);
             steps[2].done = true; steps[2].active = false;
-            triggerDownload(result.blob, `stickman_studio_${result.spec.h === 1920 ? '1080p' : result.spec.h === 1280 ? '720p' : '540p'}_${Date.now()}.mp4`);
-            updateProcessMenu(100, `MP4 downloaded · ${result.spec.w}×${result.spec.h}`, steps);
-            setTimeout(() => closeProcessMenu(), 500);
+            triggerDownload(result.blob, `stickman_studio_${result.spec.key === 'reels' ? 'ig_reels_1080p' : (result.spec.key === 'auto' ? '1080p' : result.spec.key + 'p')}_${Date.now()}.mp4`);
+            updateProcessMenu(100, `MP4 downloaded · ${result.spec.w}×${result.spec.h} · ${realMbps} Mbps (${sizeMb} MB)`, steps);
+            setTimeout(() => closeProcessMenu(), 650);
             if (requested.key === 'auto' && result.spec.key !== '1080') {
-              showToast(`Exported ${result.spec.label} (${result.spec.w}×${result.spec.h}) — the best this device can encode.`);
+              showToast(`Exported ${result.spec.label} (${result.spec.w}×${result.spec.h}, ${realMbps} Mbps) — best supported here.`);
             } else if (requested.key !== 'auto' && result.spec.key !== requested.key) {
-              showToast(`${requested.label} couldn't be encoded on this device — exported ${result.spec.label} instead.`);
+              showToast(`${requested.label} unsupported here — exported ${result.spec.label} (${realMbps} Mbps).`);
             } else {
-              showToast(`MP4 exported · ${result.spec.label} (${result.spec.w}×${result.spec.h})${hasAudioTrack ? ' with audio' : ''}!`, 'success');
+              showToast(`MP4 exported · ${result.spec.w}×${result.spec.h} · ${realMbps} Mbps (${sizeMb} MB · ${result.modeTag})`, 'success');
             }
             finished = true;
           }
@@ -5152,17 +5631,16 @@
 
       const exportBitmaps = new Map();
       try {
-        for (const im of state.images) {
-          exportBitmaps.set(im.id, await createExportBitmap(im.blob, spec.w, spec.h));
-        }
+        let lastMrWindowIdx = -2;
 
         const canvas = document.createElement('canvas');
         canvas.width = spec.w;
         canvas.height = spec.h;
-        const ctx = canvas.getContext('2d', { alpha: false });
+        const ctx = canvas.getContext('2d', { alpha: false, colorSpace: 'srgb' });
         ctx.imageSmoothingEnabled = true;
         ctx.imageSmoothingQuality = 'high';
-        const videoStream = canvas.captureStream(spec.fps);
+        const videoStream = canvas.captureStream(0);
+        const videoTrack = videoStream.getVideoTracks()[0];
 
         const Ctx = window.AudioContext || window.webkitAudioContext;
         const recAudioCtx = new Ctx({ sampleRate: 48000 });
@@ -5187,7 +5665,7 @@
             ? 'video/webm;codecs=vp8,opus'
             : 'video/webm';
 
-        const rec = new MediaRecorder(combinedStream, { mimeType: mime, videoBitsPerSecond: spec.bitrate, audioBitsPerSecond: 128_000 });
+        const rec = new MediaRecorder(combinedStream, { mimeType: mime, videoBitsPerSecond: spec.bitrate, audioBitsPerSecond: 192_000 });
         const chunks = [];
         rec.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
         const donePromise = new Promise((resolve) => { rec.onstop = resolve; });
@@ -5196,15 +5674,23 @@
         rec.start();
         audioSrc.start(0);
         const startPerf = performance.now();
+        const frameMs = 1000 / spec.fps;
 
         try {
           while (true) {
             if (state.exportCancelled) { rec.stop(); audioSrc.stop(); throw new Error('Export cancelled'); }
             const elapsed = (performance.now() - startPerf) / 1000;
             if (elapsed >= outDur) break;
-            renderFrameToContext(ctx, elapsed * speed, canvas.width, canvas.height, exportBitmaps);
+            const mrSrcT = elapsed * speed;
+            const mrIdx = findSceneIdxAtSourceTime(mrSrcT);
+            if (mrIdx !== lastMrWindowIdx) {
+              await syncExportBitmapWindow(exportBitmaps, mrIdx, canvas.width, canvas.height);
+              lastMrWindowIdx = mrIdx;
+            }
+            renderFrameToContext(ctx, mrSrcT, canvas.width, canvas.height, exportBitmaps);
+            if (videoTrack && typeof videoTrack.requestFrame === 'function') videoTrack.requestFrame();
             updateProcessMenu(15 + Math.round((elapsed / outDur) * 80), `Recording ${elapsed.toFixed(1)}s / ${outDur.toFixed(1)}s · ${spec.label}...`, steps);
-            await new Promise((r) => setTimeout(r, 12));
+            await new Promise((r) => setTimeout(r, Math.max(8, Math.round(frameMs * 0.5))));
           }
         } finally {
           try { audioSrc.stop(); } catch {}
@@ -5213,13 +5699,15 @@
           await recAudioCtx.close().catch(() => {});
         }
 
+        const outBlob = new Blob(chunks, { type: mime });
+        const realMbps = ((outBlob.size * 8) / Math.max(0.1, outDur) / 1_000_000).toFixed(1);
         steps[1].done = true; steps[1].active = false; steps[2].active = true;
         updateProcessMenu(98, 'Saving WebM video...', steps);
-        triggerDownload(new Blob(chunks, { type: mime }), `stickman_studio_${Date.now()}.webm`);
+        triggerDownload(outBlob, `stickman_studio_${Date.now()}.webm`);
         steps[2].done = true; steps[2].active = false;
-        updateProcessMenu(100, 'Video downloaded!', steps);
-        setTimeout(() => closeProcessMenu(), 500);
-        showToast(`Video exported as WebM · ${spec.label} (this browser has no MP4 encoder).`, 'success');
+        updateProcessMenu(100, `Video downloaded · ${realMbps} Mbps`, steps);
+        setTimeout(() => closeProcessMenu(), 600);
+        showToast(`Video exported as WebM · ${spec.label} (${realMbps} Mbps — fallback encoder).`, 'success');
       } finally {
         for (const bmp of exportBitmaps.values()) { try { bmp.close(); } catch {} }
         exportBitmaps.clear();
@@ -5684,8 +6172,8 @@
       scheduleSaveProject();
     });
     el.exportQualitySelect.addEventListener('change', () => {
-      state.exportQuality = EXPORT_SPECS[el.exportQualitySelect.value] ? el.exportQualitySelect.value : 'auto';
-      state.exportQualityUser = state.exportQuality !== 'auto';
+      state.exportQuality = EXPORT_SPECS[el.exportQualitySelect.value] ? el.exportQualitySelect.value : 'reels';
+      state.exportQualityUser = state.exportQuality !== 'reels';
       const s = resolveExportSpec();
       showToast(`Export set to ${s.label} (${s.w}×${s.h})`);
       scheduleSaveProject();
@@ -5793,6 +6281,11 @@
       el.gridModal.classList.add('flex');
       setTapOrderMode(true);
     });
+
+    // AI 2x Enhance Scenes
+    if (el.aiUpscaleScenesBtn) {
+      el.aiUpscaleScenesBtn.addEventListener('click', () => runAiEnhanceAllScenes());
+    }
 
     // Grid Modal
     el.openGridModalBtn.addEventListener('click', () => {
@@ -6002,6 +6495,17 @@
       renderPreviewFrame(state.currentTime);
       scheduleSaveProject();
     });
+    const reelsSafeBtn = document.getElementById('reelsSafeCaptionBtn');
+    if (reelsSafeBtn) {
+      reelsSafeBtn.addEventListener('click', () => {
+        state.captionYPercent = 64;
+        el.captionYSlider.value = '64';
+        el.captionYValue.textContent = '64%';
+        renderPreviewFrame(state.currentTime);
+        scheduleSaveProject();
+        showToast('Captions moved to Instagram Reels safe zone (64%)!', 'success');
+      });
+    }
 
     // Playback & Speed Controls
     el.playPauseBtn.addEventListener('click', () => (state.isPlaying ? pausePlayback() : startPlayback()));
