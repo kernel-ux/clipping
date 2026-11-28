@@ -1077,6 +1077,7 @@
         const db = await openStudioDB();
         const payload = {
           id: 'current',
+          syncEngineVersion: 2,
           updatedAt: Date.now(),
           scriptText: el.scriptInput.value || '',
           voiceVolume: state.voiceVolume,
@@ -1215,6 +1216,21 @@
         if (saved.bgmMeta?.id) {
           const bBlob = await loadMediaBlobFromDB(saved.bgmMeta.id);
           if (bBlob) await loadBgmBlob(bBlob, saved.bgmMeta.name, saved.bgmMeta.id, true);
+        }
+
+        // Auto-upgrade legacy saved projects (pre-v2 sync engine) onto 5ms acoustic alignment & balanced captions
+        if ((saved.syncEngineVersion || 1) < 2 && state.voiceover?.pcm16k && !state.captionsManuallyEdited) {
+          const features = getVoiceAcousticFeatures();
+          if (state.hasWhisperWords && state.rawWhisperWords.length) {
+            state.rawWhisperWords = refineWordsWith5msAcoustics(state.rawWhisperWords, state.voiceover.pcm16k, features, { ctcMode: false });
+            if (state.images.length) {
+              computeSceneBreathWindows(state.images, state.rawWhisperWords, state.voiceover.pcm16k, state.voiceover.duration);
+            }
+            state.captions = buildSceneAwareCaptionChunks(state.rawWhisperWords, state.images, 4);
+          } else if (state.images.length) {
+            state.captions = buildCaptionChunksFromScenes(state.images, state.speechSegments);
+          }
+          scheduleSaveProject();
         }
 
         if (state.hasWhisperWords && state.rawWhisperWords.length) {
@@ -1480,17 +1496,686 @@
       return Math.max(2.2, w);
     }
 
+    // =========================================================================
+    // SECTION 4B: 5ms MULTI-BAND ACOUSTIC FEATURES, DP ONSET ALIGNER & CTC VITERBI
+    // =========================================================================
+    function computeAcousticFeatures5ms(pcm, sampleRate = 16000) {
+      if (!pcm || !pcm.length) return null;
+      const step = Math.max(1, Math.round(sampleRate * 0.005)); // 5ms (80 samples @ 16kHz)
+      const win = step * 2; // 10ms window
+      const nF = Math.max(1, Math.floor((pcm.length - win) / step) + 1);
+
+      const rms = new Float32Array(nF);
+      const hiRms = new Float32Array(nF);
+      const logE = new Float32Array(nF);
+      const osf = new Float32Array(nF);
+
+      for (let f = 0; f < nF; f++) {
+        const base = f * step;
+        const end = Math.min(pcm.length, base + win);
+        let sum = 0;
+        let hiSum = 0;
+        let prevX = base > 0 ? pcm[base - 1] : pcm[base];
+        for (let i = base; i < end; i++) {
+          const x = pcm[i];
+          const dx = x - 0.92 * prevX;
+          prevX = x;
+          sum += x * x;
+          hiSum += dx * dx;
+        }
+        const cnt = Math.max(1, end - base);
+        const r = Math.sqrt(sum / cnt);
+        const hr = Math.sqrt(hiSum / cnt);
+        rms[f] = r;
+        hiRms[f] = hr;
+        logE[f] = Math.log1p(r * 120) + 0.35 * Math.log1p(hr * 120);
+      }
+
+      // Compute positive perceptual onset strength function (OSF) with 15ms pre-context
+      let maxOsf = 0.001;
+      for (let f = 0; f < nF; f++) {
+        const prev1 = f >= 2 ? logE[f - 2] : logE[0];
+        const prev2 = f >= 3 ? logE[f - 3] : prev1;
+        const prev3 = f >= 4 ? logE[f - 4] : prev2;
+        const prevAvg = (prev1 + prev2 + prev3) / 3;
+        const curAvg = f + 1 < nF ? (logE[f] + logE[f + 1]) * 0.5 : logE[f];
+        const hiPrev = f >= 2 ? Math.log1p(hiRms[f - 2] * 120) : 0;
+        const hiCur = Math.log1p(hiRms[f] * 120);
+        const val = Math.max(0, curAvg - prevAvg) + 0.55 * Math.max(0, hiCur - hiPrev);
+        osf[f] = val;
+        if (val > maxOsf) maxOsf = val;
+      }
+
+      const sortedRms = Float32Array.from(rms).sort();
+      const noiseFloor = sortedRms[Math.floor(sortedRms.length * 0.12)] || 0.004;
+      const speechMedian = sortedRms[Math.floor(sortedRms.length * 0.72)] || 0.08;
+      const spread = Math.max(0.006, speechMedian - noiseFloor);
+      const speechThr = Math.max(0.008, Math.min(speechMedian * 0.52, noiseFloor + spread * 0.18));
+
+      const sortedHi = Float32Array.from(hiRms).sort();
+      const hiFloor = sortedHi[Math.floor(sortedHi.length * 0.15)] || 0.003;
+      const hiThr = Math.max(0.007, hiFloor * 2.4);
+
+      return {
+        sampleRate,
+        step,
+        stepSec: step / sampleRate,
+        nF,
+        duration: pcm.length / sampleRate,
+        rms,
+        hiRms,
+        logE,
+        osf,
+        maxOsf,
+        noiseFloor,
+        speechMedian,
+        speechThr,
+        hiThr,
+      };
+    }
+
+    function getVoiceAcousticFeatures() {
+      const vo = state.voiceover;
+      if (!vo?.pcm16k?.length) return null;
+      if (!vo._features5ms) {
+        vo._features5ms = computeAcousticFeatures5ms(vo.pcm16k, 16000);
+      }
+      return vo._features5ms;
+    }
+
+    function findSpeechBounds5ms(features, startSec, endSec) {
+      if (!features || endSec <= startSec) return { start: startSec, end: endSec, active: false };
+      const { nF, stepSec, rms, hiRms, speechThr, hiThr } = features;
+      const f0 = Math.max(0, Math.floor(startSec / stepSec));
+      const f1 = Math.min(nF - 1, Math.ceil(endSec / stepSec));
+      if (f1 - f0 < 4) return { start: startSec, end: endSec, active: false };
+
+      let localPeak = 0;
+      for (let f = f0; f <= f1; f++) {
+        if (rms[f] > localPeak) localPeak = rms[f];
+      }
+      if (localPeak < Math.max(0.006, speechThr * 0.75)) {
+        return { start: startSec, end: endSec, active: false };
+      }
+
+      const thr = Math.max(speechThr * 0.85, Math.min(localPeak * 0.18, speechThr * 1.45));
+      let first = -1;
+      let last = -1;
+      for (let f = f0; f <= f1; f++) {
+        const voiced = rms[f] >= thr || (hiRms[f] >= hiThr && rms[f] >= thr * 0.45);
+        if (voiced) {
+          // Confirm at least 2 active frames in next 20ms to ignore isolated click transients
+          let hits = 0;
+          for (let k = f; k <= Math.min(f1, f + 3); k++) {
+            if (rms[k] >= thr * 0.7 || hiRms[k] >= hiThr) hits++;
+          }
+          if (hits >= 2 || f1 - f < 3) {
+            if (first === -1) first = f;
+            last = f;
+          }
+        }
+      }
+      if (first === -1) return { start: startSec, end: endSec, active: false };
+
+      // Walk back slightly (up to 15ms) to include quiet fricative/plosive attack ramp
+      while (first > f0 && (rms[first - 1] >= thr * 0.45 || hiRms[first - 1] >= hiThr * 0.85)) {
+        first--;
+      }
+      const s = Math.max(startSec, first * stepSec - 0.008);
+      const e = Math.min(endSec, (last + 1) * stepSec + 0.012);
+      if (e - s < 0.03) return { start: startSec, end: endSec, active: false };
+      return { start: s, end: e, active: true };
+    }
+
+    // Trim silence from any word box using 5ms speech + fricative detection
+    function trimWordToSpeechBounds(pcm, startSec, endSec, wordText, sampleRate = 16000, features = null) {
+      const feat = features || (pcm?.length ? computeAcousticFeatures5ms(pcm, sampleRate) : null);
+      if (!feat) return { start: startSec, end: endSec };
+      const bounds = findSpeechBounds5ms(feat, startSec, endSec);
+      if (bounds.active && bounds.end - bounds.start >= 0.04) {
+        return {
+          start: Number(bounds.start.toFixed(3)),
+          end: Number(bounds.end.toFixed(3)),
+        };
+      }
+      return { start: startSec, end: endSec };
+    }
+
+    // Align K words inside [startSec, endSec] to 5ms acoustic Onset Strength & valley cues via DP
+    function alignWordsToAcousticEnvelopeDP(wordTexts, startSec, endSec, features) {
+      const clean = (wordTexts || []).map((t) => String(t || '').trim()).filter(Boolean);
+      if (!clean.length) return [];
+      const K = clean.length;
+
+      const trimmedSpan = features ? findSpeechBounds5ms(features, startSec, endSec) : { start: startSec, end: endSec, active: false };
+      const spanS = trimmedSpan.active ? trimmedSpan.start : startSec;
+      const spanE = trimmedSpan.active ? Math.max(spanS + 0.05, trimmedSpan.end) : Math.max(startSec + 0.05, endSec);
+
+      if (K === 1) {
+        return [{
+          text: clean[0],
+          start: Number(spanS.toFixed(3)),
+          end: Number(Math.max(spanS + 0.04, spanE).toFixed(3)),
+        }];
+      }
+
+      if (!features || spanE - spanS < K * 0.03) {
+        return distributeWordsByWeight(clean, spanS, spanE);
+      }
+
+      const { stepSec, nF, logE, osf, maxOsf } = features;
+      const f0 = Math.max(0, Math.min(nF - 2, Math.floor(spanS / stepSec)));
+      const f1 = Math.max(f0 + K, Math.min(nF - 1, Math.ceil(spanE / stepSec)));
+      const spanFrames = f1 - f0;
+      if (spanFrames < K * 2) {
+        return distributeWordsByWeight(clean, spanS, spanE);
+      }
+
+      const weights = clean.map((w) => estimateSpokenWeight(w));
+      const totalW = weights.reduce((a, b) => a + b, 0);
+      const cumRatio = new Float64Array(K + 1);
+      for (let i = 0; i < K; i++) cumRatio[i + 1] = cumRatio[i] + weights[i] / totalW;
+
+      // Boundary score at frame f: rewards strong Onset Strength & local energy dip just prior to f
+      const bScore = new Float64Array(spanFrames + 1);
+      let maxLogE = 0.01;
+      for (let f = f0; f <= f1; f++) if (logE[f] > maxLogE) maxLogE = logE[f];
+
+      for (let rel = 1; rel < spanFrames; rel++) {
+        const f = f0 + rel;
+        const onsetTerm = osf[f] / Math.max(0.01, maxOsf);
+        const preMin = Math.min(logE[Math.max(0, f - 1)], logE[Math.max(0, f - 2)]);
+        const postAvg = (logE[f] + logE[Math.min(nF - 1, f + 1)]) * 0.5;
+        const dipTerm = Math.max(0, (postAvg - preMin) / maxLogE);
+        bScore[rel] = onsetTerm * 1.45 + dipTerm * 0.85;
+      }
+
+      const minFrames = Math.max(1, Math.min(5, Math.floor(spanFrames / (K * 2.2))));
+      const searchRad = Math.max(6, Math.round(spanFrames * 0.24));
+
+      const dp = Array.from({ length: K + 1 }, () => new Float64Array(spanFrames + 1).fill(-Infinity));
+      const parent = Array.from({ length: K + 1 }, () => new Int32Array(spanFrames + 1).fill(-1));
+      dp[0][0] = 0;
+
+      for (let i = 1; i < K; i++) {
+        const expected = Math.round(cumRatio[i] * spanFrames);
+        const lo = Math.max(i * minFrames, expected - searchRad);
+        const hi = Math.min(spanFrames - (K - i) * minFrames, expected + searchRad);
+        const prevExpected = Math.round(cumRatio[i - 1] * spanFrames);
+        const prevLo = i === 1 ? 0 : Math.max((i - 1) * minFrames, prevExpected - searchRad);
+        const prevHi = i === 1 ? 0 : Math.min(spanFrames - (K - i + 1) * minFrames, prevExpected + searchRad);
+        const wordRatio = cumRatio[i] - cumRatio[i - 1];
+
+        for (let j = lo; j <= hi; j++) {
+          const globalDev = (j / spanFrames) - cumRatio[i];
+          const globalPen = globalDev * globalDev * 3.8;
+          const bonus = bScore[j];
+          for (let p = prevLo; p <= Math.min(prevHi, j - minFrames); p++) {
+            const prevVal = dp[i - 1][p];
+            if (!Number.isFinite(prevVal)) continue;
+            const segRatio = (j - p) / spanFrames;
+            const localDev = (segRatio - wordRatio) / Math.max(0.06, wordRatio);
+            const score = prevVal + bonus - globalPen - localDev * localDev * 1.15;
+            if (score > dp[i][j]) {
+              dp[i][j] = score;
+              parent[i][j] = p;
+            }
+          }
+        }
+      }
+
+      // Final boundary K lands at spanFrames
+      const lastExpected = Math.round(cumRatio[K - 1] * spanFrames);
+      const lastLo = Math.max((K - 1) * minFrames, lastExpected - searchRad);
+      const lastHi = Math.min(spanFrames - minFrames, lastExpected + searchRad);
+      const lastWordRatio = 1 - cumRatio[K - 1];
+      let bestScore = -Infinity;
+      let bestPrev = -1;
+      for (let p = lastLo; p <= lastHi; p++) {
+        const prevVal = dp[K - 1][p];
+        if (!Number.isFinite(prevVal)) continue;
+        const segRatio = (spanFrames - p) / spanFrames;
+        const localDev = (segRatio - lastWordRatio) / Math.max(0.06, lastWordRatio);
+        const score = prevVal - localDev * localDev * 1.15;
+        if (score > bestScore) {
+          bestScore = score;
+          bestPrev = p;
+        }
+      }
+
+      if (bestPrev < 0) {
+        return distributeWordsByWeight(clean, spanS, spanE);
+      }
+
+      const bounds = new Array(K + 1);
+      bounds[0] = 0;
+      bounds[K] = spanFrames;
+      let cur = bestPrev;
+      for (let i = K - 1; i >= 1; i--) {
+        bounds[i] = cur;
+        cur = parent[i][cur];
+        if (cur < 0 && i > 1) cur = Math.round(cumRatio[i - 1] * spanFrames);
+      }
+
+      return clean.map((text, idx) => {
+        const s = idx === 0 ? spanS : Math.max(spanS, (f0 + bounds[idx]) * stepSec);
+        const e = idx === K - 1 ? spanE : Math.min(spanE, (f0 + bounds[idx + 1]) * stepSec);
+        return {
+          text,
+          start: Number(s.toFixed(3)),
+          end: Number(Math.max(s + 0.035, e).toFixed(3)),
+        };
+      });
+    }
+
+    // Expand digits, years, currency, percentages & ratios into spoken uppercase A-Z' tokens for English Wav2Vec2 CTC alignment
+    const CTC_ONES = ['', 'ONE', 'TWO', 'THREE', 'FOUR', 'FIVE', 'SIX', 'SEVEN', 'EIGHT', 'NINE', 'TEN', 'ELEVEN', 'TWELVE', 'THIRTEEN', 'FOURTEEN', 'FIFTEEN', 'SIXTEEN', 'SEVENTEEN', 'EIGHTEEN', 'NINETEEN'];
+    const CTC_TENS = ['', '', 'TWENTY', 'THIRTY', 'FORTY', 'FIFTY', 'SIXTY', 'SEVENTY', 'EIGHTY', 'NINETY'];
+    function numberIntToEnglishWords(num) {
+      if (!Number.isFinite(num) || num < 0) return '';
+      const n = Math.floor(num);
+      if (n === 0) return 'ZERO';
+      const under1000 = (x) => {
+        const out = [];
+        if (x >= 100) { out.push(CTC_ONES[Math.floor(x / 100)], 'HUNDRED'); x %= 100; }
+        if (x >= 20) { out.push(CTC_TENS[Math.floor(x / 10)]); if (x % 10) out.push(CTC_ONES[x % 10]); }
+        else if (x > 0) out.push(CTC_ONES[x]);
+        return out.join(' ');
+      };
+      if (n >= 1100 && n <= 2099 && n % 100 !== 0) {
+        const hi = Math.floor(n / 100);
+        const lo = n % 100;
+        const hiStr = hi === 20 ? 'TWENTY' : under1000(hi);
+        const loStr = lo < 10 ? `OH ${CTC_ONES[lo]}` : under1000(lo);
+        return `${hiStr} ${loStr}`.trim();
+      }
+      const parts = [];
+      if (n >= 1_000_000) {
+        parts.push(under1000(Math.floor(n / 1_000_000) % 1000), 'MILLION');
+      }
+      const remTh = Math.floor(n / 1000) % 1000;
+      if (remTh > 0) parts.push(under1000(remTh), 'THOUSAND');
+      const rem = n % 1000;
+      if (rem > 0) parts.push(under1000(rem));
+      return parts.join(' ').replace(/\s+/g, ' ').trim();
+    }
+
+    function expandWordForCtc(rawWord) {
+      let s = String(rawWord || '').trim().replace(/[’`]/g, "'");
+      if (!s) return '';
+      const hasPct = s.includes('%');
+      const hasDollar = s.includes('$');
+      const hasRupee = s.includes('₹');
+      const hasEuro = s.includes('€');
+      const hasPound = s.includes('£');
+      s = s.replace(/&/g, ' AND ').replace(/\+/g, ' PLUS ').replace(/(\d+)\s*:\s*(\d+)/g, '$1 $2');
+      s = s.replace(/[$₹€£%]/g, ' ');
+      s = s.replace(/(\d+(?:,\d{3})*(?:\.\d+)?)([kKmMbBxXpP]?)/g, (_, numRaw, suf) => {
+        const cleanNum = numRaw.replace(/,/g, '');
+        let spoken = '';
+        if (cleanNum.includes('.')) {
+          const [ip, dp] = cleanNum.split('.');
+          const decSpoken = dp.split('').map((d) => numberIntToEnglishWords(parseInt(d, 10))).join(' ');
+          spoken = `${numberIntToEnglishWords(parseInt(ip || '0', 10))} POINT ${decSpoken}`;
+        } else {
+          const val = parseInt(cleanNum, 10);
+          spoken = val <= 999_999_999 ? numberIntToEnglishWords(val) : cleanNum.split('').map((d) => numberIntToEnglishWords(parseInt(d, 10))).join(' ');
+        }
+        const ls = (suf || '').toLowerCase();
+        if (ls === 'k') spoken += ' THOUSAND';
+        else if (ls === 'm') spoken += ' MILLION';
+        else if (ls === 'b') spoken += ' BILLION';
+        else if (ls === 'x') spoken += ' X';
+        else if (ls === 'p') spoken += ' P';
+        return ` ${spoken} `;
+      });
+      if (hasDollar) s += ' DOLLARS';
+      if (hasRupee) s += ' RUPEES';
+      if (hasEuro) s += ' EUROS';
+      if (hasPound) s += ' POUNDS';
+      if (hasPct) s += ' PERCENT';
+      return s.toUpperCase().replace(/[^A-Z'\s]/g, ' ').replace(/\s+/g, ' ').trim();
+    }
+
+    // Exact CTC Viterbi Forced Alignment on [T, V] frame logits for one utterance block
+    function ctcViterbiAlignBlock(logitsData, T, V, wordInfos, charToId, blankId, delimId, blockStartSec, blockEndSec) {
+      if (!logitsData || T < 3 || !wordInfos.length) return null;
+
+      // 1. Compute log-softmax emissions [T * V]
+      const logProbs = new Float32Array(T * V);
+      for (let t = 0; t < T; t++) {
+        const off = t * V;
+        let maxV = -Infinity;
+        for (let v = 0; v < V; v++) {
+          const val = logitsData[off + v];
+          if (val > maxV) maxV = val;
+        }
+        let sumExp = 0;
+        for (let v = 0; v < V; v++) sumExp += Math.exp(logitsData[off + v] - maxV);
+        const logZ = maxV + Math.log(Math.max(1e-12, sumExp));
+        for (let v = 0; v < V; v++) logProbs[off + v] = logitsData[off + v] - logZ;
+      }
+
+      // 2. Build character sequence with word delimiters '|' and record per-word state spans
+      const tokenSeq = [];
+      const wordCharSpans = wordInfos.map(() => ({ firstTok: -1, lastTok: -1 }));
+      for (let wi = 0; wi < wordInfos.length; wi++) {
+        const ctcStr = wordInfos[wi].ctcText;
+        if (!ctcStr) continue;
+        const chars = ctcStr.replace(/\s+/g, '|').split('');
+        if (tokenSeq.length > 0 && delimId >= 0) tokenSeq.push(delimId);
+        const startTok = tokenSeq.length;
+        for (const ch of chars) {
+          const tid = ch === '|' ? delimId : charToId[ch];
+          if (typeof tid === 'number' && tid >= 0) tokenSeq.push(tid);
+        }
+        if (tokenSeq.length > startTok) {
+          wordCharSpans[wi].firstTok = startTok;
+          wordCharSpans[wi].lastTok = tokenSeq.length - 1;
+        }
+      }
+      if (!tokenSeq.length) return null;
+
+      // Extended CTC trellis: S = 2*L + 1 (even = blank, odd = tokenSeq[(s-1)/2])
+      const L = tokenSeq.length;
+      const S = 2 * L + 1;
+      if (T < L * 0.4) return null; // Too short for transcript
+
+      const labels = new Int32Array(S);
+      for (let s = 0; s < S; s++) labels[s] = (s & 1) === 0 ? blankId : tokenSeq[(s - 1) >> 1];
+
+      const NEG_INF = -1e30;
+      let prevDp = new Float32Array(S).fill(NEG_INF);
+      let currDp = new Float32Array(S).fill(NEG_INF);
+      const backPtr = new Uint8Array(T * S);
+
+      prevDp[0] = logProbs[labels[0]];
+      if (S > 1) prevDp[1] = logProbs[labels[1]];
+
+      for (let t = 1; t < T; t++) {
+        const rowOff = t * V;
+        const bpOff = t * S;
+        currDp.fill(NEG_INF);
+        for (let s = 0; s < S; s++) {
+          const emit = logProbs[rowOff + labels[s]];
+          let best = prevDp[s];
+          let src = 0;
+          if (s >= 1 && prevDp[s - 1] > best) {
+            best = prevDp[s - 1];
+            src = 1;
+          }
+          if (s >= 3 && (s & 1) === 1 && labels[s] !== labels[s - 2] && prevDp[s - 2] > best) {
+            best = prevDp[s - 2];
+            src = 2;
+          }
+          if (best > NEG_INF * 0.5) {
+            currDp[s] = best + emit;
+            backPtr[bpOff + s] = src;
+          }
+        }
+        const tmp = prevDp; prevDp = currDp; currDp = tmp;
+      }
+
+      let curS = S - 1;
+      if (S >= 2 && prevDp[S - 2] > prevDp[S - 1]) curS = S - 2;
+      if (prevDp[curS] <= NEG_INF * 0.5) return null;
+
+      const path = new Int32Array(T);
+      let totalEmitLogP = 0;
+      let nonBlankFrames = 0;
+      for (let t = T - 1; t >= 0; t--) {
+        path[t] = curS;
+        if ((curS & 1) === 1 && labels[curS] !== delimId) {
+          totalEmitLogP += logProbs[t * V + labels[curS]];
+          nonBlankFrames++;
+        }
+        if (t > 0) curS -= backPtr[t * S + curS];
+      }
+
+      const avgLogProb = totalEmitLogP / Math.max(1, nonBlankFrames);
+      const frameCenterSec = (f) => {
+        const sec = blockStartSec + ((f * 320 + 200) / 16000);
+        return Math.max(blockStartSec, Math.min(blockEndSec, sec));
+      };
+
+      const aligned = wordInfos.map((w, wi) => {
+        const span = wordCharSpans[wi];
+        if (span.firstTok === -1) return { ...w, ctcStart: null, ctcEnd: null };
+        const minState = 2 * span.firstTok + 1;
+        const maxState = 2 * span.lastTok + 1;
+        let fFirst = -1;
+        let fLast = -1;
+        for (let t = 0; t < T; t++) {
+          const st = path[t];
+          if ((st & 1) === 1 && st >= minState && st <= maxState && labels[st] !== delimId) {
+            if (fFirst === -1) fFirst = t;
+            fLast = t;
+          }
+        }
+        if (fFirst === -1) return { ...w, ctcStart: null, ctcEnd: null };
+        const sSec = Math.max(blockStartSec, frameCenterSec(fFirst) - 0.010);
+        const eSec = Math.min(blockEndSec, frameCenterSec(fLast) + 0.015);
+        return {
+          ...w,
+          ctcStart: Number(sSec.toFixed(3)),
+          ctcEnd: Number(Math.max(sSec + 0.025, eSec).toFixed(3)),
+        };
+      });
+
+      return { aligned, avgLogProb };
+    }
+
+    // Refine word boundaries using 5ms acoustic Onset Strength & speech envelopes
+    function refineWordsWith5msAcoustics(words, pcm, features = null, options = {}) {
+      if (!words || !words.length) return words;
+      const feat = features || (pcm?.length ? computeAcousticFeatures5ms(pcm, 16000) : null);
+      if (!feat) return words;
+
+      const ctcMode = !!options.ctcMode;
+      const dur = feat.duration;
+      const out = words.map((w) => ({ ...w }));
+      const { stepSec, nF, logE, osf, maxOsf, rms, speechThr } = feat;
+
+      // Helper: find cleanest 5ms onset peak in [searchLo, searchHi]
+      const findBestOnsetInRange = (approxSec, searchLo, searchHi, requireValley = false) => {
+        const fLo = Math.max(1, Math.floor(searchLo / stepSec));
+        const fHi = Math.min(nF - 2, Math.ceil(searchHi / stepSec));
+        if (fHi <= fLo) return null;
+        const centerF = approxSec / stepSec;
+        let bestF = -1;
+        let bestScore = -Infinity;
+
+        for (let f = fLo; f <= fHi; f++) {
+          const osfNorm = osf[f] / Math.max(0.01, maxOsf);
+          if (osfNorm < 0.04) continue;
+          const postSpeech = (rms[f] + rms[Math.min(nF - 1, f + 1)] + rms[Math.min(nF - 1, f + 2)]) / 3;
+          if (postSpeech < speechThr * 0.7) continue;
+
+          let dipBonus = 0;
+          if (requireValley) {
+            const preMin = Math.min(rms[Math.max(0, f - 1)], rms[Math.max(0, f - 2)]);
+            const postMax = Math.max(rms[f], rms[Math.min(nF - 1, f + 1)], rms[Math.min(nF - 1, f + 2)], rms[Math.min(nF - 1, f + 3)]);
+            if (postMax <= speechThr * 0.85 || preMin > postMax * 0.85) continue;
+            dipBonus = Math.max(0, (postMax - preMin) / Math.max(0.02, postMax));
+          }
+
+          const distPenalty = Math.abs(f - centerF) * 0.018;
+          const score = osfNorm * 1.4 + dipBonus * 0.8 - distPenalty;
+          if (score > bestScore) {
+            bestScore = score;
+            bestF = f;
+          }
+        }
+        return bestF !== -1 ? (bestF * stepSec) : null;
+      };
+
+      if (ctcMode) {
+        // CTC gives 20ms phoneme anchors: snap starts within [-40ms, +25ms] to exact 5ms acoustic onset
+        for (let i = 0; i < out.length; i++) {
+          const w = out[i];
+          const prev = i > 0 ? out[i - 1] : null;
+          const next = i + 1 < out.length ? out[i + 1] : null;
+          const gapBefore = prev ? w.start - prev.end : 1.0;
+
+          if (gapBefore >= 0.045) {
+            // Post-pause or first word: trim leading silence / find crisp speech start
+            const winLo = prev ? Math.max(prev.end + 0.015, w.start - 0.08) : Math.max(0, w.start - 0.08);
+            const winHi = Math.min(w.end + 0.04, w.start + 0.06);
+            const sb = findSpeechBounds5ms(feat, winLo, winHi);
+            if (sb.active && sb.start < w.end - 0.02) {
+              w.start = Number(sb.start.toFixed(3));
+            }
+          } else if (prev) {
+            // Connected speech after CTC: refine onset in [-38ms, +22ms] without crushing prev word
+            const lo = Math.max(prev.start + 0.04, w.start - 0.038);
+            const hi = Math.min((next ? next.start : w.end) - 0.03, w.start + 0.022);
+            const snapped = findBestOnsetInRange(w.start, lo, hi, false);
+            if (snapped !== null && snapped > prev.start + 0.04) {
+              w.start = Number(snapped.toFixed(3));
+              if (prev.end > w.start) prev.end = w.start;
+            }
+          }
+        }
+
+        // Extend short CTC character spikes cleanly across the word's true spoken tail without stealing real pauses
+        for (let i = 0; i < out.length; i++) {
+          const w = out[i];
+          const next = i + 1 < out.length ? out[i + 1] : null;
+          const maxEnd = next ? Math.max(w.end, next.start - 0.004) : dur;
+          if (maxEnd > w.end + 0.015) {
+            const sb = findSpeechBounds5ms(feat, w.start, maxEnd);
+            if (sb.active && sb.end > w.end) {
+              w.end = Number(Math.min(maxEnd, sb.end).toFixed(3));
+            }
+          }
+          if (next && w.end > next.start) w.end = next.start;
+          if (w.end <= w.start) w.end = Number(Math.min(dur, w.start + 0.04).toFixed(3));
+        }
+        return out;
+      }
+
+      // ---- Tier 2: Non-CTC Whisper / Fallback Acoustic Alignment ----
+      // 1. Trim dead silence from every word bordered by pauses (no 0.32s blind skip!)
+      for (let i = 0; i < out.length; i++) {
+        const w = out[i];
+        const prev = i > 0 ? out[i - 1] : null;
+        const next = i + 1 < out.length ? out[i + 1] : null;
+        const gapBefore = prev ? w.start - prev.end : 1.0;
+        const gapAfter = next ? next.start - w.end : 1.0;
+        if (gapBefore >= 0.04 || gapAfter >= 0.04) {
+          const sb = findSpeechBounds5ms(feat, w.start, w.end);
+          if (sb.active && sb.end - sb.start >= 0.04) {
+            if (gapBefore >= 0.04) w.start = Number(sb.start.toFixed(3));
+            if (gapAfter >= 0.04) w.end = Number(sb.end.toFixed(3));
+          }
+        }
+      }
+
+      // 2. Detect & repair squished/collapsed Whisper clusters using 5ms Acoustic DP
+      let i = 0;
+      while (i < out.length) {
+        const expectedMin = Math.max(0.055, estimateSpokenWeight(out[i].text) * 0.014);
+        const isSquished = (out[i].end - out[i].start) < expectedMin;
+        if (!isSquished) { i++; continue; }
+
+        let lo = i;
+        while (lo > 0 && (out[lo].start - out[lo - 1].end) < 0.08 && (lo === i || (out[lo - 1].end - out[lo - 1].start) < 0.14)) {
+          lo--;
+        }
+        let hi = i;
+        while (hi + 1 < out.length && (out[hi + 1].start - out[hi].end) < 0.08 && ((out[hi + 1].end - out[hi + 1].start) < 0.16 || hi === i)) {
+          hi++;
+        }
+        if (hi > lo) {
+          const texts = out.slice(lo, hi + 1).map((x) => x.text);
+          const spanS = out[lo].start;
+          const spanE = out[hi].end;
+          const repaired = alignWordsToAcousticEnvelopeDP(texts, spanS, spanE, feat);
+          if (repaired.length === texts.length) {
+            for (let k = 0; k < repaired.length; k++) {
+              out[lo + k].start = repaired[k].start;
+              out[lo + k].end = repaired[k].end;
+            }
+          }
+        }
+        i = hi + 1;
+      }
+
+      // 3. Measure systematic Whisper global onset bias on clean post-pause starts
+      const biasSamples = [];
+      for (let idx = 0; idx < out.length; idx++) {
+        const prev = idx > 0 ? out[idx - 1] : null;
+        const gap = prev ? out[idx].start - prev.end : 1.0;
+        if (gap < 0.14) continue;
+        const probeLo = prev ? Math.max(prev.end + 0.02, out[idx].start - 0.14) : Math.max(0, out[idx].start - 0.14);
+        const probeHi = Math.min(out[idx].end, out[idx].start + 0.14);
+        const sb = findSpeechBounds5ms(feat, probeLo, probeHi);
+        if (sb.active) {
+          const diff = sb.start - out[idx].start;
+          if (Math.abs(diff) <= 0.13) biasSamples.push(diff);
+        }
+      }
+      if (biasSamples.length >= 4) {
+        biasSamples.sort((a, b) => a - b);
+        const medianBias = biasSamples[Math.floor(biasSamples.length / 2)];
+        if (Math.abs(medianBias) >= 0.015) {
+          for (let idx = 0; idx < out.length; idx++) {
+            const prev = idx > 0 ? out[idx - 1] : null;
+            const gapBefore = prev ? out[idx].start - prev.end : 1.0;
+            // Shift connected words by medianBias; post-pause starts already snapped below
+            if (gapBefore < 0.14) {
+              const s = Math.max(prev ? prev.start + 0.04 : 0, Math.min(out[idx].end - 0.03, out[idx].start + medianBias));
+              out[idx].start = Number(s.toFixed(3));
+              if (prev && prev.end > out[idx].start) prev.end = out[idx].start;
+            }
+          }
+        }
+      }
+
+      // 4. Final 5ms onset polish on both post-pause starts and connected boundaries
+      for (let idx = 0; idx < out.length; idx++) {
+        const w = out[idx];
+        const prev = idx > 0 ? out[idx - 1] : null;
+        const gap = prev ? w.start - prev.end : 1.0;
+        if (gap >= 0.10) {
+          const lo = prev ? Math.max(prev.end + 0.02, w.start - 0.12) : Math.max(0, w.start - 0.12);
+          const hi = Math.min(w.end - 0.03, w.start + 0.12);
+          const sb = findSpeechBounds5ms(feat, lo, hi);
+          if (sb.active && sb.start < w.end - 0.03) {
+            w.start = Number(sb.start.toFixed(3));
+          }
+        } else if (prev) {
+          const lo = Math.max(prev.start + 0.045, w.start - 0.065);
+          const hi = Math.min(w.end - 0.04, w.start + 0.065);
+          const snapped = findBestOnsetInRange(w.start, lo, hi, true);
+          if (snapped !== null && snapped > prev.start + 0.045 && snapped < w.end - 0.04) {
+            w.start = Number(snapped.toFixed(3));
+            if (prev.end > w.start) prev.end = w.start;
+          }
+        }
+      }
+
+      // 5. Guarantee strictly monotonic non-overlapping bounds
+      for (let idx = 0; idx < out.length; idx++) {
+        if (idx > 0 && out[idx].start < out[idx - 1].end) {
+          out[idx - 1].end = out[idx].start;
+        }
+        if (out[idx].end <= out[idx].start) {
+          const nextS = idx + 1 < out.length ? out[idx + 1].start : dur;
+          out[idx].end = Number(Math.min(nextS, out[idx].start + 0.04).toFixed(3));
+        }
+      }
+      return out;
+    }
+
     // Whisper DTW often stretches a single word's timestamp backwards/forwards across an adjacent pause.
     // Trim leading/trailing dead air from over-long word boxes to expose true spoken start/end & breath pauses!
     function trimWordToSpeechBounds(pcm, startSec, endSec, wordText, sampleRate = 16000) {
       if (!pcm || !pcm.length) return { start: startSec, end: endSec };
-      const dur = endSec - startSec;
-      const spokenLen = estimateSpokenWeight(wordText);
-      const expectedMax = Math.max(0.32, spokenLen * 0.085);
-      if (dur <= expectedMax) return { start: startSec, end: endSec };
-
-      const bounds = getSpeechBoundsInWindow(pcm, startSec, endSec, sampleRate);
-      if (bounds.end - bounds.start >= 0.06) {
+      const feat = (state.voiceover?.pcm16k === pcm) ? getVoiceAcousticFeatures() : computeAcousticFeatures5ms(pcm, sampleRate);
+      if (!feat) return { start: startSec, end: endSec };
+      const bounds = findSpeechBounds5ms(feat, startSec, endSec);
+      if (bounds.active && bounds.end - bounds.start >= 0.045) {
         return {
           start: Number(bounds.start.toFixed(3)),
           end: Number(bounds.end.toFixed(3)),
@@ -1575,8 +2260,13 @@
           duration: audioBuffer.duration,
           audioBuffer,
           pcm16k,
+          _features5ms: computeAcousticFeatures5ms(pcm16k, 16000),
         };
         state.speechSegments = speechSegments;
+        if (typeof invalidateStretchedVoiceCache === 'function') invalidateStretchedVoiceCache();
+        if (typeof prewarmStretchedVoiceBuffer === 'function') {
+          setTimeout(() => prewarmStretchedVoiceBuffer(state.playbackSpeed || 1.15), 40);
+        }
 
         el.voiceAudioEl.muted = state.isMuted;
         el.voiceAudioEl.volume = state.voiceVolume;
@@ -3128,6 +3818,83 @@
       return normalizeCaptionTimeline(chunks);
     }
 
+    // Balanced phrase chunker: groups words into natural 2-4 word visual captions without 1-word orphans or dangling prepositions
+    function splitSpanIntoBalancedCaptionChunks(spanWords, maxWordsPerChunk = 4, maxChars = 24) {
+      const N = spanWords.length;
+      if (!N) return [];
+      if (N === 1) return [spanWords];
+
+      const dp = new Float64Array(N + 1).fill(Infinity);
+      const prevIdx = new Int32Array(N + 1).fill(-1);
+      dp[0] = 0;
+
+      for (let j = 1; j <= N; j++) {
+        for (let k = Math.max(0, j - maxWordsPerChunk); k < j; k++) {
+          if (!Number.isFinite(dp[k])) continue;
+          const slice = spanWords.slice(k, j);
+          const count = slice.length;
+          const chars = slice.map((w) => w.text).join(' ').length;
+          if (count > 1 && chars > maxChars) continue;
+
+          let cost = 1.0; // base cost per chunk (prefers fewer cleanly packed chunks over many fragments)
+          if (count === 1) {
+            // Heavily penalize 1-word orphans unless the single word is long enough to stand alone
+            cost += slice[0].text.length >= 11 ? 1.2 : 5.5;
+          } else {
+            // Ideal sweet spot is 2-3 crisp words per chunk
+            const target = chars <= 16 ? 2.8 : 2.3;
+            cost += Math.pow(count - target, 2) * 0.65;
+          }
+
+          const lastW = slice[count - 1];
+          const lastClean = lastW.text.toLowerCase().replace(/[^a-z0-9']/g, '');
+          const nextW = j < N ? spanWords[j] : null;
+          const gapAfter = nextW ? Math.max(0, nextW.start - lastW.end) : 0.4;
+
+          if (j < N) {
+            if (/[,;:—–.!?]["'”’)]*$/.test(lastW.text)) cost -= 1.1;
+            else if (nextW && CLAUSE_LEAD_WORDS.has(nextW.text.toLowerCase().replace(/[^a-z0-9']/g, ''))) cost -= 0.45;
+            if (DANGLING_END_WORDS.has(lastClean) && gapAfter < 0.08 && !/[,;:.!?—–-]$/.test(lastW.text)) {
+              cost += 2.2;
+            }
+            if (gapAfter > 0.06) cost -= Math.min(1.4, gapAfter * 5.0);
+          }
+
+          const totalCost = dp[k] + cost;
+          if (totalCost < dp[j]) {
+            dp[j] = totalCost;
+            prevIdx[j] = k;
+          }
+        }
+      }
+
+      if (!Number.isFinite(dp[N])) {
+        // Fallback greedy split if DP encountered an over-long word > maxChars
+        const out = [];
+        let cur = [];
+        for (const w of spanWords) {
+          const len = cur.map((x) => x.text).join(' ').length + w.text.length + 1;
+          if (cur.length && (cur.length >= maxWordsPerChunk || len > maxChars)) {
+            out.push(cur);
+            cur = [];
+          }
+          cur.push(w);
+        }
+        if (cur.length) out.push(cur);
+        return out;
+      }
+
+      const groups = [];
+      let cur = N;
+      while (cur > 0) {
+        const p = prevIdx[cur];
+        groups.push(spanWords.slice(p, cur));
+        cur = p;
+      }
+      groups.reverse();
+      return groups;
+    }
+
     function buildSceneAwareCaptionChunks(words, images, maxWordsPerChunk = 4) {
       if (!words || !words.length) return [];
       const cutTimes = (images || []).slice(1).map((im) => im.start);
@@ -3136,19 +3903,6 @@
           .map((im) => (typeof im.lockedWordIdx === 'number' && im.lockedWordIdx > 0 ? im.lockedWordIdx : -1))
           .filter((idx) => idx > 0)
       );
-      const chunks = [];
-      let cur = [];
-
-      const flush = () => {
-        if (!cur.length) return;
-        chunks.push({
-          start: cur[0].start,
-          end: cur[cur.length - 1].end,
-          text: cur.map((w) => w.text).join(' '),
-          words: cur.map((w) => ({ ...w })),
-        });
-        cur = [];
-      };
 
       const getSceneIdxForTime = (t) => {
         for (let i = 0; i < cutTimes.length; i++) {
@@ -3157,24 +3911,45 @@
         return cutTimes.length;
       };
 
+      // 1. Partition into hard phrase spans at scene cuts, pauses > 0.30s, or sentence-ending punctuation
+      const spans = [];
+      let curSpan = [];
       for (let i = 0; i < words.length; i++) {
         const w = words[i];
-        const prev = cur[cur.length - 1];
+        const prev = curSpan[curSpan.length - 1];
         const gap = prev ? w.start - prev.end : 0;
-        const charLen = cur.map((x) => x.text).join(' ').length + w.text.length;
         const hitLockedCut = lockedCutWordIndices.has(i);
         const crossedScene = hitLockedCut || (
           lockedCutWordIndices.size === 0 && prev &&
           getSceneIdxForTime((prev.start + prev.end) * 0.5) !== getSceneIdxForTime((w.start + w.end) * 0.5)
         );
-
-        if (cur.length && (crossedScene || cur.length >= maxWordsPerChunk || gap > 0.36 || charLen > 24)) {
-          flush();
+        if (curSpan.length && (crossedScene || gap > 0.30)) {
+          spans.push(curSpan);
+          curSpan = [];
         }
-        cur.push(w);
-        if (/[.!?]$/.test(w.text) && cur.length >= 2) flush();
+        curSpan.push(w);
+        if (/[.!?]["'”’)]*$/.test(w.text.trim())) {
+          spans.push(curSpan);
+          curSpan = [];
+        }
       }
-      flush();
+      if (curSpan.length) spans.push(curSpan);
+
+      // 2. Balance each span cleanly into 2-4 word chunks (never creating awkward 4+1 orphans!)
+      const chunks = [];
+      for (const span of spans) {
+        const balanced = splitSpanIntoBalancedCaptionChunks(span, maxWordsPerChunk, 23);
+        for (const grp of balanced) {
+          if (!grp.length) continue;
+          chunks.push({
+            start: grp[0].start,
+            end: grp[grp.length - 1].end,
+            text: grp.map((w) => w.text).join(' '),
+            words: grp.map((w) => ({ ...w })),
+          });
+        }
+      }
+
       const normalized = normalizeCaptionTimeline(chunks);
 
       // Keep outgoing subtitle cleanly finished before each scene's breath transition starts
@@ -3183,6 +3958,12 @@
         for (const cap of normalized) {
           if (cap.start < bStart && cap.end > bStart + 0.015 && (cap.start + cap.end) * 0.5 < images[s].start) {
             cap.end = Number(Math.max(cap.start + 0.12, bStart).toFixed(3));
+            if (Array.isArray(cap.words)) {
+              for (let wi = 0; wi < cap.words.length; wi++) {
+                cap.words[wi].end = Math.min(cap.words[wi].end, cap.end);
+                cap.words[wi].start = Math.min(cap.words[wi].start, Math.max(cap.start, cap.end - 0.03));
+              }
+            }
           }
         }
       }
@@ -3842,6 +4623,7 @@
 
     function buildCaptionChunksFromScenes(images, speechSegments) {
       if (!images || !images.length) return [];
+      const features = getVoiceAcousticFeatures();
       const allWords = [];
 
       for (const im of images) {
@@ -3868,11 +4650,17 @@
               : Math.max(1, Math.round(((g.end - g.start) / totalActive) * rawWords.length));
             const slice = rawWords.slice(cursor, cursor + share);
             cursor += slice.length;
-            allWords.push(...distributeWordsByWeight(slice, g.start, g.end));
+            allWords.push(...(features
+              ? alignWordsToAcousticEnvelopeDP(slice, g.start, g.end, features)
+              : distributeWordsByWeight(slice, g.start, g.end)));
           }
         } else {
           const pad = Math.min(0.05, Math.max(0, (im.end - im.start) * 0.05));
-          allWords.push(...distributeWordsByWeight(rawWords, im.start + pad, Math.max(im.start + 0.1, im.end - pad)));
+          const spanS = im.start + pad;
+          const spanE = Math.max(im.start + 0.1, im.end - pad);
+          allWords.push(...(features
+            ? alignWordsToAcousticEnvelopeDP(rawWords, spanS, spanE, features)
+            : distributeWordsByWeight(rawWords, spanS, spanE)));
         }
       }
 
@@ -3930,11 +4718,11 @@
     }
 
     // =========================================================================
-    // SECTION 7: PAUSE-CHUNKED WHISPER WASM ENGINE (TRUE WORD-LEVEL TIMESTAMPS)
+    // SECTION 7: WHISPER ASR + WAV2VEC2 CTC FORCED ALIGNMENT + 5ms ONSET ENGINE
     // =========================================================================
     function createWhisperWorkerBlobUrl() {
       const code = `
-        import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.4.0';
+        import { pipeline, AutoProcessor, AutoModelForCTC, env } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.4.0';
         env.allowLocalModels = false;
         env.useBrowserCache = true;
         if (env.backends?.onnx?.wasm) {
@@ -3943,6 +4731,9 @@
         }
         let transcriber = null;
         let loadedModel = '';
+        let ctcProcessor = null;
+        let ctcModel = null;
+        let ctcVocab = null;
 
         async function loadModel(postProgress) {
           if (transcriber) return transcriber;
@@ -3954,13 +4745,13 @@
           let lastErr = null;
           for (const cfg of candidates) {
             try {
-              postProgress(12, 'Loading ' + cfg.model.split('/').pop() + ' (WASM)...');
+              postProgress(10, 'Loading ' + cfg.model.split('/').pop() + ' (WASM)...');
               transcriber = await pipeline('automatic-speech-recognition', cfg.model, {
                 device: 'wasm',
                 dtype: cfg.dtype,
                 progress_callback: (p) => {
                   if (p && typeof p.progress === 'number') {
-                    postProgress(12 + Math.round(p.progress * 0.42), 'Downloading AI model: ' + Math.round(p.progress) + '%');
+                    postProgress(10 + Math.round(p.progress * 0.35), 'Downloading Whisper model: ' + Math.round(p.progress) + '%');
                   }
                 },
               });
@@ -3973,19 +4764,134 @@
           throw lastErr || new Error('Failed to load Whisper model');
         }
 
+        function extractVocabMap(tokenizer) {
+          const charToId = {};
+          let blankId = 0;
+          let delimId = -1;
+
+          const registerToken = (tokStr, id) => {
+            if (typeof tokStr !== 'string' || typeof id !== 'number') return;
+            if (tokStr === '<pad>' || tokStr === '[PAD]') { blankId = id; return; }
+            if (tokStr === '|' || tokStr === ' ') { delimId = id; return; }
+            const up = tokStr.toUpperCase();
+            if (/^[A-Z']$/.test(up)) charToId[up] = id;
+          };
+
+          const rawVocab = tokenizer?.model?.vocab;
+          if (Array.isArray(rawVocab)) {
+            for (let id = 0; id < rawVocab.length; id++) registerToken(rawVocab[id], id);
+          } else if (rawVocab && typeof rawVocab === 'object') {
+            for (const [tok, id] of Object.entries(rawVocab)) registerToken(tok, id);
+          }
+
+          if (tokenizer?.model?.tokens_to_ids && typeof tokenizer.model.tokens_to_ids.entries === 'function') {
+            for (const [tok, id] of tokenizer.model.tokens_to_ids.entries()) registerToken(tok, id);
+          }
+
+          if (Object.keys(charToId).length < 20 && typeof tokenizer?.decode === 'function') {
+            const size = tokenizer.vocab_size || 40;
+            for (let id = 0; id < Math.min(size, 64); id++) {
+              try {
+                const d = tokenizer.decode([id], { skip_special_tokens: false });
+                registerToken(d, id);
+              } catch {}
+            }
+          }
+
+          if (delimId === -1 && typeof tokenizer?.encode === 'function') {
+            try {
+              const ids = tokenizer.encode('A B', { add_special_tokens: false });
+              if (Array.isArray(ids) && ids.length === 3) {
+                charToId['A'] = ids[0];
+                delimId = ids[1];
+                charToId['B'] = ids[2];
+              }
+            } catch {}
+          }
+          if (delimId === -1) delimId = 4;
+          return { charToId, blankId, delimId };
+        }
+
+        async function loadCtcAligner(postProgress) {
+          if (ctcProcessor && ctcModel && ctcVocab) {
+            return { processor: ctcProcessor, model: ctcModel, vocab: ctcVocab };
+          }
+          const modelId = 'Xenova/wav2vec2-base-960h';
+          postProgress(68, 'Loading 20ms CTC Forced Aligner (one-time cache)...');
+          ctcProcessor = await AutoProcessor.from_pretrained(modelId);
+          const dtypes = ['q8', 'q4'];
+          let lastErr = null;
+          for (const dtype of dtypes) {
+            try {
+              ctcModel = await AutoModelForCTC.from_pretrained(modelId, {
+                device: 'wasm',
+                dtype,
+                progress_callback: (p) => {
+                  if (p && typeof p.progress === 'number') {
+                    postProgress(68 + Math.round(p.progress * 0.16), 'Downloading CTC Aligner (' + dtype + '): ' + Math.round(p.progress) + '%');
+                  }
+                },
+              });
+              break;
+            } catch (e) {
+              lastErr = e;
+            }
+          }
+          if (!ctcModel) throw lastErr || new Error('Failed to load CTC Aligner');
+          ctcVocab = extractVocabMap(ctcProcessor.tokenizer);
+          if (Object.keys(ctcVocab.charToId).length < 24) {
+            ctcModel = null;
+            throw new Error('Incompatible CTC tokenizer vocab');
+          }
+          return { processor: ctcProcessor, model: ctcModel, vocab: ctcVocab };
+        }
+
         self.onmessage = async (e) => {
-          const { pcm, duration } = e.data;
+          const data = e.data || {};
+          const msgType = data.type || 'asr';
           const postProgress = (pct, msg) => self.postMessage({ type: 'progress', pct, msg });
+
+          if (msgType === 'ctc_align') {
+            try {
+              const { processor, model, vocab } = await loadCtcAligner(postProgress);
+              const blocks = Array.isArray(data.blocks) ? data.blocks : [];
+              const results = [];
+              for (let b = 0; b < blocks.length; b++) {
+                const blk = blocks[b];
+                postProgress(84 + Math.round(((b + 0.5) / Math.max(1, blocks.length)) * 10), 'Forced-aligning block ' + (b + 1) + '/' + blocks.length + '...');
+                if (!blk.pcmSlice || blk.pcmSlice.length < 800) {
+                  results.push(null);
+                  continue;
+                }
+                const inputs = await processor(blk.pcmSlice);
+                const outputs = await model(inputs);
+                const logits = outputs?.logits;
+                if (!logits || !logits.dims || logits.dims.length < 3) {
+                  results.push(null);
+                  continue;
+                }
+                results.push({
+                  dims: Array.from(logits.dims),
+                  data: Float32Array.from(logits.data),
+                });
+              }
+              self.postMessage({ type: 'ctc_done', vocab, results });
+            } catch (err) {
+              self.postMessage({ type: 'ctc_error', message: err?.message || String(err) });
+            }
+            return;
+          }
+
           try {
             const pipe = await loadModel(postProgress);
-            postProgress(58, 'Transcribing word timings (' + loadedModel.split('/').pop() + ')...');
+            postProgress(48, 'Transcribing speech (' + loadedModel.split('/').pop() + ')...');
             let result = null;
             let wordLevel = true;
             try {
-              result = await pipe(pcm, { return_timestamps: 'word' });
+              result = await pipe(data.pcm, { return_timestamps: 'word' });
             } catch (wordErr) {
               wordLevel = false;
-              result = await pipe(pcm, { return_timestamps: true });
+              result = await pipe(data.pcm, { return_timestamps: true });
             }
             self.postMessage({ type: 'done', result: { ...(result || {}), wordLevel } });
           } catch (err) {
@@ -4077,7 +4983,7 @@
             whisperWorker = null;
             reject(err);
           };
-          whisperWorker.postMessage({ pcm, duration });
+          whisperWorker.postMessage({ type: 'asr', pcm, duration });
         });
       } catch (workerErr) {
         console.warn('Whisper Worker fallback to main thread:', workerErr);
@@ -4098,7 +5004,7 @@
             dtype: { encoder_model: 'fp32', decoder_model_merged: 'q8' },
             progress_callback: (p) => {
               if (p && typeof p.progress === 'number') {
-                onProgress(15 + Math.round(p.progress * 0.4), `Downloading model: ${Math.round(p.progress)}%`);
+                onProgress(15 + Math.round(p.progress * 0.35), `Downloading model: ${Math.round(p.progress)}%`);
               }
             },
           });
@@ -4108,7 +5014,7 @@
             dtype: 'q8',
             progress_callback: (p) => {
               if (p && typeof p.progress === 'number') {
-                onProgress(15 + Math.round(p.progress * 0.4), `Downloading model: ${Math.round(p.progress)}%`);
+                onProgress(15 + Math.round(p.progress * 0.35), `Downloading model: ${Math.round(p.progress)}%`);
               }
             },
           });
@@ -4133,10 +5039,10 @@
       for (let idx = 0; idx < audioChunks.length; idx++) {
         const ch = audioChunks[idx];
         const partLabel = audioChunks.length > 1 ? ` (Part ${idx + 1}/${audioChunks.length})` : '';
-        const basePct = 55 + Math.round((idx / audioChunks.length) * 37);
+        const basePct = 44 + Math.round((idx / audioChunks.length) * 22);
 
         const res = await runSingleWhisperChunk(ch.pcm, ch.duration, (pct, msg) => {
-          const mappedPct = idx === 0 && pct < 55 ? pct : Math.max(basePct, Math.min(92, pct));
+          const mappedPct = idx === 0 && pct < 44 ? pct : Math.max(basePct, Math.min(66, pct));
           onProgress(mappedPct, `${msg}${partLabel}`);
         });
 
@@ -4154,9 +5060,187 @@
       return { text: mergedTexts.join(' ').trim(), chunks: mergedChunks, wordLevel: allWordLevel };
     }
 
+    // Group draft words into pause-bounded utterance blocks <= 14s for ultra-fast, drift-free CTC forced alignment
+    function buildCtcAlignmentBlocks(words, duration, pcm16k, sr = 16000) {
+      if (!words.length || !pcm16k?.length) return [];
+      const blocks = [];
+      let startIdx = 0;
+
+      const pushBlock = (fromIdx, toIdx) => {
+        const firstW = words[fromIdx];
+        const lastW = words[toIdx];
+        const prevEnd = fromIdx > 0 ? words[fromIdx - 1].end : 0;
+        const nextStart = toIdx + 1 < words.length ? words[toIdx + 1].start : duration;
+        const padLeft = Math.min(0.24, Math.max(0.04, (firstW.start - prevEnd) * 0.5));
+        const padRight = Math.min(0.24, Math.max(0.04, (nextStart - lastW.end) * 0.5));
+        const blockStartSec = Math.max(0, firstW.start - padLeft);
+        const blockEndSec = Math.min(duration, lastW.end + padRight);
+        const s0 = Math.max(0, Math.floor(blockStartSec * sr));
+        const s1 = Math.min(pcm16k.length, Math.ceil(blockEndSec * sr));
+        if (s1 - s0 < 800) return;
+
+        const slice = pcm16k.slice(s0, s1);
+        const wordInfos = [];
+        for (let k = fromIdx; k <= toIdx; k++) {
+          wordInfos.push({
+            idx: k,
+            text: words[k].text,
+            ctcText: expandWordForCtc(words[k].text),
+          });
+        }
+        blocks.push({
+          fromIdx,
+          toIdx,
+          blockStartSec: s0 / sr,
+          blockEndSec: s1 / sr,
+          pcmSlice: slice,
+          wordInfos,
+        });
+      };
+
+      for (let i = 1; i < words.length; i++) {
+        const gap = words[i].start - words[i - 1].end;
+        const spanDur = words[i].end - words[startIdx].start;
+        if ((gap >= 0.22 && spanDur >= 1.2) || spanDur >= 13.5) {
+          // If forced split by 13.5s cap, split at largest gap in recent 40% of block
+          let splitAt = i - 1;
+          if (gap < 0.22 && i - startIdx > 4) {
+            let maxG = -1;
+            const scanFrom = startIdx + Math.floor((i - startIdx) * 0.55);
+            for (let k = scanFrom; k < i; k++) {
+              const g = words[k + 1].start - words[k].end;
+              if (g > maxG) { maxG = g; splitAt = k; }
+            }
+          }
+          pushBlock(startIdx, splitAt);
+          startIdx = splitAt + 1;
+        }
+      }
+      pushBlock(startIdx, words.length - 1);
+      return blocks;
+    }
+
+    async function runCtcForcedAlignment(words, pcm16k, duration, onProgress) {
+      if (!words.length || !pcm16k?.length || !whisperWorker) return { ok: false };
+      // Skip CTC if transcript is mostly non-English / non-Latin
+      let latinWords = 0;
+      for (const w of words) {
+        if (expandWordForCtc(w.text).length > 0) latinWords++;
+      }
+      if (latinWords / Math.max(1, words.length) < 0.68) return { ok: false };
+
+      const blocks = buildCtcAlignmentBlocks(words, duration, pcm16k, 16000);
+      if (!blocks.length) return { ok: false };
+
+      const workerBlocks = blocks.map((b) => ({
+        pcmSlice: b.pcmSlice,
+        blockStartSec: b.blockStartSec,
+        blockEndSec: b.blockEndSec,
+      }));
+
+      const ctcRes = await new Promise((resolve) => {
+        const cleanup = () => {
+          if (!whisperWorker) return;
+          whisperWorker.onmessage = null;
+          whisperWorker.onerror = null;
+        };
+        const timer = setTimeout(() => {
+          cleanup();
+          resolve({ ok: false, reason: 'timeout' });
+        }, 90000);
+        whisperWorker.onmessage = (e) => {
+          const d = e.data || {};
+          if (d.type === 'progress') onProgress(d.pct, d.msg);
+          else if (d.type === 'ctc_done') {
+            clearTimeout(timer);
+            cleanup();
+            resolve({ ok: true, vocab: d.vocab, results: d.results });
+          } else if (d.type === 'ctc_error') {
+            clearTimeout(timer);
+            cleanup();
+            resolve({ ok: false, reason: d.message });
+          }
+        };
+        whisperWorker.onerror = () => {
+          clearTimeout(timer);
+          cleanup();
+          whisperWorker = null;
+          resolve({ ok: false, reason: 'worker error' });
+        };
+        whisperWorker.postMessage({ type: 'ctc_align', blocks: workerBlocks });
+      });
+
+      if (!ctcRes.ok || !ctcRes.vocab || !Array.isArray(ctcRes.results)) {
+        return { ok: false, reason: ctcRes.reason };
+      }
+
+      const { charToId, blankId, delimId } = ctcRes.vocab;
+      const out = words.map((w) => ({ ...w }));
+      let alignedBlocks = 0;
+      let alignedWords = 0;
+
+      for (let b = 0; b < blocks.length; b++) {
+        const blk = blocks[b];
+        const rawLogits = ctcRes.results[b];
+        if (!rawLogits?.dims || !rawLogits?.data) continue;
+        const T = rawLogits.dims[1];
+        const V = rawLogits.dims[2];
+        const viterbi = ctcViterbiAlignBlock(
+          rawLogits.data,
+          T,
+          V,
+          blk.wordInfos,
+          charToId,
+          blankId,
+          delimId,
+          blk.blockStartSec,
+          blk.blockEndSec
+        );
+        if (!viterbi || viterbi.avgLogProb < -8.5) continue;
+
+        alignedBlocks++;
+        for (let k = 0; k < viterbi.aligned.length; k++) {
+          const item = viterbi.aligned[k];
+          if (typeof item.ctcStart === 'number' && typeof item.ctcEnd === 'number') {
+            out[item.idx].start = item.ctcStart;
+            out[item.idx].end = item.ctcEnd;
+            alignedWords++;
+          }
+        }
+        // Interpolate any symbol-only words inside this block cleanly between aligned neighbors
+        for (let k = 0; k < viterbi.aligned.length; k++) {
+          const item = viterbi.aligned[k];
+          if (typeof item.ctcStart === 'number') continue;
+          const prevW = k > 0 ? out[item.idx - 1] : null;
+          const nextW = k + 1 < viterbi.aligned.length ? out[item.idx + 1] : null;
+          const s = prevW ? prevW.end : blk.blockStartSec;
+          const e = nextW ? Math.max(s + 0.04, nextW.start) : Math.max(s + 0.04, blk.blockEndSec);
+          out[item.idx].start = Number(s.toFixed(3));
+          out[item.idx].end = Number(e.toFixed(3));
+        }
+      }
+
+      if (!alignedBlocks || alignedWords < Math.ceil(words.length * 0.5)) {
+        return { ok: false, reason: 'low confidence' };
+      }
+
+      // Enforce monotonic non-overlapping bounds before 5ms onset refinement
+      for (let i = 1; i < out.length; i++) {
+        if (out[i].start < out[i - 1].end) {
+          out[i - 1].end = out[i].start;
+        }
+        if (out[i].end <= out[i].start) {
+          out[i].end = Number(Math.min(duration, out[i].start + 0.035).toFixed(3));
+        }
+      }
+
+      return { ok: true, words: out };
+    }
+
     // Distribute multi-word segment strictly across actual spoken speech islands inside [spanS, spanE] (NEVER across silence!)
     function distributeWordsAcrossActiveSpeech(words, spanS, spanE, speechSegments) {
       if (!words.length) return [];
+      const features = getVoiceAcousticFeatures();
       const active = [];
       for (const seg of (speechSegments || [])) {
         const s = Math.max(spanS, seg.start);
@@ -4166,7 +5250,10 @@
       if (active.length <= 1) {
         const targetS = active.length === 1 ? active[0].start : spanS;
         const targetE = active.length === 1 ? active[0].end : spanE;
-        return distributeWordsByWeight(words, targetS, Math.max(targetS + 0.08, targetE));
+        const eSafe = Math.max(targetS + 0.08, targetE);
+        return features
+          ? alignWordsToAcousticEnvelopeDP(words, targetS, eSafe, features)
+          : distributeWordsByWeight(words, targetS, eSafe);
       }
 
       const totalSpeech = active.reduce((acc, g) => acc + (g.end - g.start), 0);
@@ -4196,14 +5283,21 @@
         }
         const slice = words.slice(wCursor, endIdx);
         wCursor = endIdx;
-        if (slice.length) out.push(...distributeWordsByWeight(slice, seg.start, seg.end));
+        if (slice.length) {
+          out.push(...(features
+            ? alignWordsToAcousticEnvelopeDP(slice, seg.start, seg.end, features)
+            : distributeWordsByWeight(slice, seg.start, seg.end)));
+        }
       }
       return out;
     }
 
-    function repairAndExtractWhisperWords(result, duration, pcm16k) {
+    function repairAndExtractWhisperWords(result, duration, pcm16k, skipFinalRefine = false) {
       const rawChunks = Array.isArray(result?.chunks) ? result.chunks : [];
       const extracted = [];
+      const features = (pcm16k && state.voiceover?.pcm16k === pcm16k)
+        ? getVoiceAcousticFeatures()
+        : (pcm16k ? computeAcousticFeatures5ms(pcm16k, 16000) : null);
 
       for (let i = 0; i < rawChunks.length; i++) {
         const ch = rawChunks[i];
@@ -4220,10 +5314,10 @@
         s = Math.max(0, Math.min(duration, s));
         e = Math.max(s + 0.04, Math.min(duration, e));
 
-        // Merge standalone punctuation or no-space contraction suffixes ('t, 's, 're, -minute) back onto previous word!
+        // Merge standalone punctuation, symbols (%), or no-space continuation subwords ('t, 's, :16, .5) back onto previous word!
         const isAttachableSuffix = extracted.length > 0 && (
-          /^[.,!?;:…]+$/.test(text) ||
-          (!rawText.startsWith(' ') && /^['’\-]/.test(text))
+          /^[.,!?;:…%°)\]]+$/.test(text) ||
+          (!rawText.startsWith(' ') && (/^['’\-.,!?;:%)\]]/.test(text) || /^[:.\d]/.test(text)) && !/[.!?]$/.test(extracted[extracted.length - 1].text))
         );
         if (isAttachableSuffix) {
           const prev = extracted[extracted.length - 1];
@@ -4232,16 +5326,22 @@
           continue;
         }
 
+        // Merge standalone leading currency symbol onto following number
+        if (extracted.length > 0 && /^[$₹€£(\[]+$/.test(extracted[extracted.length - 1].text)) {
+          const prev = extracted[extracted.length - 1];
+          prev.text = prev.text + text;
+          prev.end = Number(Math.max(prev.end, e).toFixed(3));
+          continue;
+        }
+
         const parts = text.split(/\s+/).filter(Boolean);
         if (parts.length === 1) {
-          // Strip DTW silence stretching from single words so breath pauses between sentences are crystal-clear!
           const trimmed = pcm16k ? trimWordToSpeechBounds(pcm16k, s, e, parts[0]) : { start: s, end: e };
           extracted.push({ text: parts[0], start: Number(trimmed.start.toFixed(3)), end: Number(trimmed.end.toFixed(3)) });
         } else {
-          const bounds = pcm16k ? getSpeechBoundsInWindow(pcm16k, s, e) : { start: s, end: e };
-          const spanS = bounds.end - bounds.start >= 0.12 ? bounds.start : s;
-          const spanE = bounds.end - bounds.start >= 0.12 ? bounds.end : e;
-          // Distribute multi-word chunks strictly across active speech islands (NEVER across internal pauses!)
+          const bounds = features ? findSpeechBounds5ms(features, s, e) : { start: s, end: e, active: false };
+          const spanS = bounds.active && bounds.end - bounds.start >= 0.12 ? bounds.start : s;
+          const spanE = bounds.active && bounds.end - bounds.start >= 0.12 ? bounds.end : e;
           extracted.push(...distributeWordsAcrossActiveSpeech(parts, spanS, spanE, state.speechSegments));
         }
       }
@@ -4261,7 +5361,6 @@
 
       for (let i = 1; i < extracted.length; i++) {
         if (extracted[i].start < extracted[i - 1].end) {
-          // Gently resolve any minor overlap without collapsing real pauses
           const mid = (extracted[i - 1].end + extracted[i].start) * 0.5;
           extracted[i - 1].end = Number(Math.max(extracted[i - 1].start + 0.03, mid).toFixed(3));
           extracted[i].start = Number(Math.max(extracted[i - 1].end, mid).toFixed(3));
@@ -4270,43 +5369,13 @@
           extracted[i].end = Number(Math.min(duration, extracted[i].start + 0.08).toFixed(3));
         }
       }
-      return pcm16k ? refineWordOnsets(extracted, pcm16k) : extracted;
+      if (skipFinalRefine || !pcm16k) return extracted;
+      return refineWordsWith5msAcoustics(extracted, pcm16k, features, { ctcMode: false });
     }
 
-    // Whisper word starts are often 50-150ms off. Snap each start to the real energy valley between two
-    // touching words (bounded to +-90ms), so the marker lands exactly when the word is heard.
     function refineWordOnsets(words, pcm, sr = 16000) {
-      if (!pcm || !pcm.length || words.length < 2) return words;
-      const step = Math.floor(sr * 0.005);
-      const nF = Math.floor(pcm.length / step);
-      const raw = new Float32Array(nF);
-      for (let f = 0; f < nF; f++) {
-        let sum = 0; const b = f * step;
-        for (let k = 0; k < step; k++) sum += pcm[b + k] * pcm[b + k];
-        raw[f] = Math.sqrt(sum / step);
-      }
-      const sm = new Float32Array(nF);
-      for (let f = 0; f < nF; f++) sm[f] = (raw[Math.max(0, f - 1)] + raw[f] + raw[Math.min(nF - 1, f + 1)]) / 3;
-      for (let i = 1; i < words.length; i++) {
-        const w = words[i], prev = words[i - 1];
-        if (w.start - prev.end > 0.12) continue;
-        const c = Math.round((w.start * sr) / step);
-        const lo = Math.max(0, c - 18), hi = Math.min(nF - 1, c + 18);
-        let m = lo;
-        for (let f = lo; f <= hi; f++) if (sm[f] < sm[m]) m = f;
-        let pL = 0, pR = 0;
-        for (let f = Math.max(0, m - 20); f <= m; f++) pL = Math.max(pL, sm[f]);
-        for (let f = m; f <= Math.min(nF - 1, m + 20); f++) pR = Math.max(pR, sm[f]);
-        const pk = Math.min(pL, pR);
-        if (pk > 0.015 && sm[m] < pk * 0.55) {
-          const ns = (m * step) / sr;
-          if (ns > prev.start + 0.04 && ns < w.end - 0.04) {
-            w.start = Number(ns.toFixed(3));
-            if (prev.end > w.start) prev.end = w.start;
-          }
-        }
-      }
-      return words;
+      const feat = (state.voiceover?.pcm16k === pcm) ? getVoiceAcousticFeatures() : computeAcousticFeatures5ms(pcm, sr);
+      return refineWordsWith5msAcoustics(words, pcm, feat, { ctcMode: false });
     }
 
     async function runTranscribeAndSync() {
@@ -4320,7 +5389,8 @@
 
       const steps = [
         { label: 'Load on-device Whisper WASM model', active: true, done: false },
-        { label: 'Transcribe pause-chunked word timestamps', active: false, done: false },
+        { label: 'Transcribe spoken words', active: false, done: false },
+        { label: '20ms CTC Forced Alignment + 5ms Onset Lock', active: false, done: false },
         { label: 'Lock scene cuts & captions to spoken voice', active: false, done: false },
       ];
       openProcessMenu('Transcribing & Syncing', 'Preparing 16kHz audio...', false);
@@ -4328,16 +5398,38 @@
 
       try {
         const result = await runWhisperInference(state.voiceover.pcm16k, state.voiceover.duration, (pct, msg) => {
-          if (pct >= 55) { steps[0].done = true; steps[0].active = false; steps[1].active = true; }
+          if (pct >= 44) { steps[0].done = true; steps[0].active = false; steps[1].active = true; }
           updateProcessMenu(pct, msg, steps);
         });
 
         steps[0].done = true; steps[1].done = true; steps[1].active = false; steps[2].active = true;
-        updateProcessMenu(94, 'Locking scene cuts & captions...', steps);
+        updateProcessMenu(67, 'Preparing 20ms CTC Forced Alignment...', steps);
         await yieldToUi();
 
-        const words = repairAndExtractWhisperWords(result, state.voiceover.duration, state.voiceover.pcm16k);
+        let words = repairAndExtractWhisperWords(result, state.voiceover.duration, state.voiceover.pcm16k, true);
         if (!words.length) throw new Error('No speech detected in audio');
+
+        const features = getVoiceAcousticFeatures();
+        let usedCtc = false;
+        try {
+          const ctc = await runCtcForcedAlignment(words, state.voiceover.pcm16k, state.voiceover.duration, (pct, msg) => {
+            updateProcessMenu(pct, msg, steps);
+          });
+          if (ctc.ok && ctc.words?.length === words.length) {
+            words = ctc.words;
+            usedCtc = true;
+          }
+        } catch (ctcErr) {
+          console.warn('CTC forced alignment skipped, using 5ms DSP alignment:', ctcErr);
+        }
+
+        updateProcessMenu(95, usedCtc ? 'Refining to 5ms acoustic onsets...' : 'Applying 5ms acoustic onset lock...', steps);
+        await yieldToUi();
+        words = refineWordsWith5msAcoustics(words, state.voiceover.pcm16k, features, { ctcMode: usedCtc });
+
+        steps[2].done = true; steps[2].active = false; steps[3].active = true;
+        updateProcessMenu(97, 'Locking scene cuts & captions...', steps);
+        await yieldToUi();
 
         state.rawWhisperWords = words;
         state.hasWhisperWords = true;
@@ -4349,9 +5441,10 @@
         }
         state.captions = buildSceneAwareCaptionChunks(words, state.images, 4);
 
-        el.whisperStatusText.textContent = `${state.lastSyncMode} · ${words.length} words`;
-        steps[2].done = true; steps[2].active = false;
-        updateProcessMenu(100, `Synced ${words.length} spoken words (${state.lastSyncMode})!`, steps);
+        const engineTag = usedCtc ? 'CTC+5ms' : '5ms Lock';
+        el.whisperStatusText.textContent = `${state.lastSyncMode} (${engineTag}) · ${words.length} words`;
+        steps[3].done = true; steps[3].active = false;
+        updateProcessMenu(100, `Locked ${words.length} words (${engineTag} · ${state.lastSyncMode})!`, steps);
         await yieldToUi();
 
         renderAllUI();
@@ -4359,9 +5452,9 @@
         scheduleSaveProject();
         setTimeout(() => closeProcessMenu(), 350);
         if (state.lastSyncMode === 'Voice Paced (Script Mismatch)') {
-          showToast('Script differed from voiceover — auto-paced cleanly to spoken sentences!', 'info');
+          showToast(`Script differed from voiceover — ${engineTag} auto-paced cleanly!`, 'info');
         } else {
-          showToast(`${state.lastSyncMode}: ${words.length} word timestamps locked!`, 'success');
+          showToast(`${state.lastSyncMode} (${engineTag}): ${words.length} words locked!`, 'success');
         }
       } catch (err) {
         console.error('runTranscribeAndSync error:', err);
@@ -4442,12 +5535,11 @@
       ctx.restore();
     }
 
-    // ---- Subtitle marker engine ------------------------------------------------
-    // Text is measured once per caption (not every frame) and the highlight is a pure function
-    // of time, so the live preview and the exported video draw the exact same marker.
-    const CAPTION_MARKER_LEAD = 0.025;  // gentle 25ms lead so the pill starts gliding right on the consonant
-    const CAPTION_MARKER_GLIDE = 0.045;  // crisp 45ms glide onto the spoken word
-    const CAPTION_LATIN_PROBE = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    // ---- Kinetic Subtitle Marker Engine ---------------------------------------
+    // Pure function of time t so live preview, scrubbing, and 30fps/60fps exports match 1:1.
+    const CAPTION_MARKER_LEAD = 0.034;   // 34ms anticipation so the pill reaches ~75% arrival AT word onset
+    const CAPTION_MARKER_GLIDE = 0.090;  // silky 90ms real-time glide (automatically clamped on fast words)
+    const CAPTION_LATIN_PROBE = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
     const MARK_WHITE = [255, 255, 255];
     const MARK_INK = [9, 9, 11];
     const MARK_SOFT = [244, 244, 245];
@@ -4469,8 +5561,63 @@
       return 1 - t * t * t;
     }
 
+    function easeOutQuart(p) {
+      const t = 1 - Math.max(0, Math.min(1, p));
+      return 1 - t * t * t * t;
+    }
+
+    function easeOutBackSubtle(p) {
+      const x = Math.max(0, Math.min(1, p));
+      const c1 = 0.72; // gentle ~2.2% tactile settle, never bouncy/distracting
+      const c3 = c1 + 1;
+      return 1 + c3 * Math.pow(x - 1, 3) + c1 * Math.pow(x - 1, 2);
+    }
+
+    function smoothstep01(edge0, edge1, x) {
+      const t = Math.max(0, Math.min(1, (x - edge0) / Math.max(1e-5, edge1 - edge0)));
+      return t * t * (3 - 2 * t);
+    }
+
     function mixRgb(a, b, k) {
       return `rgb(${Math.round(a[0] + (b[0] - a[0]) * k)},${Math.round(a[1] + (b[1] - a[1]) * k)},${Math.round(a[2] + (b[2] - a[2]) * k)})`;
+    }
+
+    // Compute continuous, non-teleporting active-word trajectory at time t
+    function computeCaptionMarkerFrame(words, t, spd) {
+      const W = words.length;
+      const moveStart = new Float64Array(W);
+      const moveEnd = new Float64Array(W);
+
+      moveStart[0] = words[0].start - Math.min(CAPTION_MARKER_LEAD * spd, 0.045);
+      moveEnd[0] = moveStart[0];
+
+      for (let i = 1; i < W; i++) {
+        const slot = Math.max(0.015, words[i].start - words[i - 1].start);
+        const lead = Math.min(CAPTION_MARKER_LEAD * spd, slot * 0.42);
+        moveStart[i] = Math.max(moveStart[i - 1] + 0.016, words[i].start - lead);
+      }
+      for (let i = 1; i < W; i++) {
+        const nextStart = i + 1 < W
+          ? moveStart[i + 1]
+          : Math.max(moveStart[i] + 0.12, words[i].end + 0.05);
+        const maxDur = Math.max(0.004, (nextStart - moveStart[i]) * 0.88);
+        const glideDur = Math.min(CAPTION_MARKER_GLIDE * spd, maxDur);
+        moveEnd[i] = moveStart[i] + glideDur;
+      }
+
+      let activeWordIdx = 0;
+      for (let i = 0; i < W; i++) {
+        if (moveStart[i] <= t) activeWordIdx = i;
+        else break;
+      }
+
+      let rawP = 1;
+      if (activeWordIdx > 0) {
+        const span = Math.max(0.004, moveEnd[activeWordIdx] - moveStart[activeWordIdx]);
+        rawP = Math.max(0, Math.min(1, (t - moveStart[activeWordIdx]) / span));
+      }
+      const glide = activeWordIdx === 0 ? 1 : easeOutQuart(rawP);
+      return { activeWordIdx, glide, rawP, firstMoveStart: moveStart[0] };
     }
 
     function getCaptionLayout(ctx, cap, w, fontSize) {
@@ -4481,17 +5628,28 @@
       const hit = captionLayoutWeak.get(cap);
       if (hit && hit.key === key) return hit.layout;
 
-      const spaceW = Math.round(fontSize * 0.30);
-      const maxLineW = w * 0.86;
+      const capProbe = ctx.measureText('HIMWXYZ08');
+      const capAscent = typeof capProbe.actualBoundingBoxAscent === 'number' && capProbe.actualBoundingBoxAscent > fontSize * 0.35
+        ? capProbe.actualBoundingBoxAscent
+        : fontSize * 0.72;
+      const capDescent = typeof capProbe.actualBoundingBoxDescent === 'number'
+        ? Math.min(fontSize * 0.12, Math.max(0, capProbe.actualBoundingBoxDescent))
+        : 0;
+
+      const spaceW = Math.round(fontSize * 0.35);
+      const maxLineW = w * 0.88;
       const lines = [];
       const byIdx = [];
       let cur = [];
       let curW = 0;
 
-      // Wrap words cleanly into 1–2 balanced lines (same rules as before)
       for (let i = 0; i < words.length; i++) {
         const display = words[i].text.toUpperCase();
-        const mw = ctx.measureText(display).width;
+        const tm = ctx.measureText(display);
+        const mw = tm.width;
+        const inkLeft = typeof tm.actualBoundingBoxLeft === 'number' ? -tm.actualBoundingBoxLeft : 0;
+        const inkRight = typeof tm.actualBoundingBoxRight === 'number' ? tm.actualBoundingBoxRight : mw;
+        const inkWidth = Math.max(2, inkRight - inkLeft);
         const addW = cur.length ? spaceW + mw : mw;
         if (cur.length && curW + addW > maxLineW) {
           lines.push({ items: cur, width: curW });
@@ -4499,7 +5657,7 @@
           curW = 0;
         }
         const dx = cur.length ? curW + spaceW : 0;
-        const item = { text: display, width: mw, idx: i, dx };
+        const item = { text: display, width: mw, inkLeft, inkWidth, idx: i, dx };
         cur.push(item);
         curW = dx + mw;
         byIdx[i] = { li: lines.length, item };
@@ -4510,7 +5668,9 @@
         lines,
         byIdx,
         spaceW,
-        lineHeight: Math.round(fontSize * 1.32),
+        capAscent,
+        capDescent,
+        lineHeight: Math.round(fontSize * 1.34),
         maxW: Math.max(...lines.map((l) => l.width)),
       };
       captionLayoutWeak.set(cap, { key, layout });
@@ -4520,11 +5680,12 @@
     function renderCaptionOnCanvas(ctx, t, w, h) {
       if (state.captionStyle === 'off' || !state.captions.length) return;
       let activeCap = null;
-      // Newest caption wins at overlaps so the previous line never lingers over the next one
+      let activeCapIdx = -1;
       for (let i = state.captions.length - 1; i >= 0; i--) {
         const c = state.captions[i];
-        if (t >= c.start - 0.03 && t <= c.end + 0.06) {
+        if (t >= c.start - 0.036 && t <= c.end + 0.065) {
           activeCap = c;
+          activeCapIdx = i;
           break;
         }
       }
@@ -4532,80 +5693,128 @@
 
       const words = activeCap.words;
       const style = state.captionStyle;
-
-      // Active word = the LAST word that has started (plus a tiny lead). The old overlapping windows
-      // kept the previous word lit for ~40ms after the next one began, which is what felt laggy.
       const spd = state.playbackSpeed || 1.0;
-      const lead = CAPTION_MARKER_LEAD * spd;
-      const glideDur = CAPTION_MARKER_GLIDE * spd;
-      const probe = t + lead;
-      let activeWordIdx = 0;
-      for (let i = 0; i < words.length; i++) {
-        if (words[i].start <= probe) activeWordIdx = i;
-        else break;
+
+      const { activeWordIdx, glide, firstMoveStart } = computeCaptionMarkerFrame(words, t, spd);
+
+      // Subtle crisp entrance pop (Word 0 pill starts 100% locked!) + smooth pause-tail fade
+      const popInStart = Math.min(activeCap.start - 0.034, firstMoveStart);
+      const popDur = 0.052 * spd;
+      const inP = Math.max(0, Math.min(1, (t - popInStart) / popDur));
+      const blockScale = 0.94 + 0.06 * easeOutBackSubtle(inP);
+      let blockAlpha = easeOutCubic(inP);
+
+      const nextCap = activeCapIdx + 1 < state.captions.length ? state.captions[activeCapIdx + 1] : null;
+      const hasPauseAfter = !nextCap || (nextCap.start - activeCap.end > 0.14);
+      if (hasPauseAfter && t > activeCap.end) {
+        blockAlpha *= Math.max(0, 1 - (t - activeCap.end) / 0.065);
       }
-      const glide = easeOutCubic((t - (words[activeWordIdx].start - lead)) / glideDur);
+      if (blockAlpha <= 0.01) return;
 
       const fontSize = Math.round(w * 0.068);
+      const centerY = h * ((state.captionYPercent || 78) / 100);
 
       ctx.save();
+      ctx.globalAlpha = blockAlpha;
+      if (Math.abs(blockScale - 1) > 0.001) {
+        ctx.translate(w * 0.5, centerY);
+        ctx.scale(blockScale, blockScale);
+        ctx.translate(-w * 0.5, -centerY);
+      }
+
       ctx.font = `900 ${fontSize}px Inter, system-ui, sans-serif`;
-      ctx.textBaseline = 'middle';
+      ctx.textBaseline = 'alphabetic';
       ctx.textAlign = 'left';
 
       const layout = getCaptionLayout(ctx, activeCap, w, fontSize);
-      const { lines, lineHeight } = layout;
+      const { lines, lineHeight, capAscent, capDescent } = layout;
 
       const totalBlockH = lines.length * lineHeight;
-      const centerY = h * ((state.captionYPercent || 78) / 100);
       const startY = centerY - totalBlockH * 0.5 + lineHeight * 0.5;
+      const inkH = capAscent + capDescent;
+      const baselineOffset = (capAscent - capDescent) * 0.5;
 
       if (style === 'minimal-box') {
-        const padX = Math.round(fontSize * 0.45);
+        const padX = Math.round(fontSize * 0.46);
         const padY = Math.round(fontSize * 0.30);
-        ctx.fillStyle = 'rgba(9, 9, 11, 0.78)';
+        ctx.fillStyle = 'rgba(9, 9, 11, 0.80)';
         drawRoundedRect(ctx, (w - layout.maxW) * 0.5 - padX, centerY - totalBlockH * 0.5 - padY, layout.maxW + padX * 2, totalBlockH + padY * 2, Math.round(fontSize * 0.32));
         ctx.fill();
       }
 
-      // Yellow pill: ONE pill that glides from the previous word onto the active word.
+      // Compute per-word lift & color blend (Word 0 is lit from frame 1; snappy colorK avoids muddy gray)
+      const wordLiftFor = (idx) => {
+        if (idx === activeWordIdx) return glide;
+        if (idx === activeWordIdx - 1) return 1 - glide;
+        return 0;
+      };
+
+      // Yellow pill: single continuous gliding pill, optically centered on uppercase ink bounds
       if (style === 'yellow-pill') {
-        const padX = Math.round(fontSize * 0.22);
-        const padY = Math.round(fontSize * 0.14);
+        const padX = Math.round(fontSize * 0.23);
+        const padY = Math.round(fontSize * 0.19);
         const radius = Math.round(fontSize * 0.24);
         const rectFor = (idx) => {
           const ref = layout.byIdx[idx];
           if (!ref) return null;
           const line = lines[ref.li];
+          const x0 = Math.round((w - line.width) * 0.5);
+          const xWord = Math.round(x0 + ref.item.dx);
+          const lineCY = Math.round(startY + ref.li * lineHeight);
+          const kLift = wordLiftFor(idx);
+          const sc = 1 + 0.042 * kLift;
+          const baseW = ref.item.inkWidth + padX * 2;
+          const baseH = inkH + padY * 2;
+          const cx = xWord + ref.item.inkLeft + ref.item.inkWidth * 0.5;
+          const rw = baseW * sc;
+          const rh = baseH * sc;
           return {
-            x: (w - line.width) * 0.5 + ref.item.dx - padX,
-            y: startY + ref.li * lineHeight - fontSize * 0.56 - padY * 0.5,
-            w: ref.item.width + padX * 2,
-            h: fontSize * 1.12 + padY,
+            x: cx - rw * 0.5,
+            y: lineCY - rh * 0.5,
+            w: rw,
+            h: rh,
             li: ref.li,
           };
         };
+
         const fillPill = (r, alpha) => {
-          if (!r || alpha <= 0.01) return;
-          ctx.globalAlpha = alpha;
-          ctx.fillStyle = '#facc15';
-          drawRoundedRect(ctx, r.x, r.y, r.w, r.h, radius);
+          if (!r || alpha <= 0.01 || r.w <= 2 || r.h <= 2) return;
+          ctx.save();
+          ctx.globalAlpha = blockAlpha * alpha;
+          ctx.shadowColor = 'rgba(0, 0, 0, 0.34)';
+          ctx.shadowBlur = Math.max(4, Math.round(fontSize * 0.20));
+          ctx.shadowOffsetY = Math.max(1, Math.round(fontSize * 0.06));
+          const grad = ctx.createLinearGradient(r.x, r.y, r.x, r.y + r.h);
+          grad.addColorStop(0, '#fde047');
+          grad.addColorStop(1, '#facc15');
+          ctx.fillStyle = grad;
+          drawRoundedRect(ctx, r.x, r.y, r.w, r.h, Math.min(radius, r.w * 0.45));
           ctx.fill();
-          ctx.globalAlpha = 1;
+          ctx.restore();
         };
+
         const cur = rectFor(activeWordIdx);
         const prev = activeWordIdx > 0 ? rectFor(activeWordIdx - 1) : null;
         if (cur) {
           if (prev && prev.li === cur.li) {
             fillPill({
               x: prev.x + (cur.x - prev.x) * glide,
-              y: cur.y,
+              y: prev.y + (cur.y - prev.y) * glide,
               w: prev.w + (cur.w - prev.w) * glide,
-              h: cur.h,
+              h: prev.h + (cur.h - prev.h) * glide,
             }, 1);
+          } else if (prev) {
+            // Crisp ribbon wipe across line wrap (never ghostly double fade!)
+            const outW = prev.w * (1 - glide);
+            if (outW > 4) {
+              fillPill({ x: prev.x + (prev.w - outW), y: prev.y, w: outW, h: prev.h }, Math.min(1, (1 - glide) * 2.2));
+            }
+            const inW = cur.w * glide;
+            if (inW > 4) {
+              fillPill({ x: cur.x, y: cur.y, w: inW, h: cur.h }, Math.min(1, glide * 2.2));
+            }
           } else {
-            if (prev) fillPill(prev, 1 - glide);
-            fillPill(cur, glide);
+            fillPill(cur, 1);
           }
         }
       }
@@ -4613,34 +5822,45 @@
       for (let li = 0; li < lines.length; li++) {
         const line = lines[li];
         const x0 = Math.round((w - line.width) * 0.5);
-        const y = Math.round(startY + li * lineHeight);
+        const lineCY = Math.round(startY + li * lineHeight);
+        const baseY = lineCY + baselineOffset;
 
         for (const item of line.items) {
-          // k = how "lit" this word is (0..1). Cross-fades with the pill so colours never pop.
-          const k = item.idx === activeWordIdx ? glide : (item.idx === activeWordIdx - 1 ? 1 - glide : 0);
+          const kRaw = wordLiftFor(item.idx);
+          const colorK = smoothstep01(0.28, 0.68, kRaw);
+          const wordScale = 1 + 0.042 * kRaw;
           const x = Math.round(x0 + item.dx);
+          const wordCX = x + item.inkLeft + item.inkWidth * 0.5;
+
+          ctx.save();
+          if (Math.abs(wordScale - 1) > 0.001) {
+            ctx.translate(wordCX, lineCY);
+            ctx.scale(wordScale, wordScale);
+            ctx.translate(-wordCX, -lineCY);
+          }
 
           if (style === 'yellow-pill') {
-            const strokeA = 0.92 * (1 - k);
+            const strokeA = 0.94 * (1 - colorK);
             if (strokeA > 0.02) {
               ctx.lineWidth = Math.max(4, Math.round(fontSize * 0.16));
               ctx.lineJoin = 'round';
               ctx.strokeStyle = `rgba(0, 0, 0, ${strokeA.toFixed(3)})`;
-              ctx.strokeText(item.text, x, y);
+              ctx.strokeText(item.text, x, baseY);
             }
-            ctx.fillStyle = mixRgb(MARK_WHITE, MARK_INK, k);
-            ctx.fillText(item.text, x, y);
+            ctx.fillStyle = mixRgb(MARK_WHITE, MARK_INK, colorK);
+            ctx.fillText(item.text, x, baseY);
           } else if (style === 'clean-bold') {
             ctx.lineWidth = Math.max(5, Math.round(fontSize * 0.18));
             ctx.lineJoin = 'round';
             ctx.strokeStyle = 'rgba(0, 0, 0, 0.95)';
-            ctx.strokeText(item.text, x, y);
-            ctx.fillStyle = mixRgb(MARK_WHITE, MARK_GOLD, k);
-            ctx.fillText(item.text, x, y);
+            ctx.strokeText(item.text, x, baseY);
+            ctx.fillStyle = mixRgb(MARK_WHITE, MARK_GOLD, colorK);
+            ctx.fillText(item.text, x, baseY);
           } else {
-            ctx.fillStyle = mixRgb(MARK_SOFT, MARK_GOLD, k);
-            ctx.fillText(item.text, x, y);
+            ctx.fillStyle = mixRgb(MARK_SOFT, MARK_GOLD, colorK);
+            ctx.fillText(item.text, x, baseY);
           }
+          ctx.restore();
         }
       }
       ctx.restore();
@@ -4815,8 +6035,50 @@
     }
 
     // =========================================================================
-    // SECTION 9: ZERO-DRIFT HARDWARE-ANCHORED PLAYBACK ENGINE + FALLBACK
+    // SECTION 9: ZERO-DRIFT HARDWARE-ANCHORED PLAYBACK ENGINE + WSOLA WEBAUDIO
     // =========================================================================
+    let stretchedVoiceCache = null; // { id, speed, audioBuffer }
+
+    function invalidateStretchedVoiceCache() {
+      stretchedVoiceCache = null;
+    }
+
+    function getOrBuildStretchedVoiceBuffer(speed) {
+      const vo = state.voiceover;
+      if (!vo?.audioBuffer || vo.duration > 240) return null;
+      const safeRate = Math.max(0.5, Math.min(2.0, Number(speed) || 1.15));
+      if (Math.abs(safeRate - 1.0) < 0.005) return vo.audioBuffer;
+      if (
+        stretchedVoiceCache &&
+        stretchedVoiceCache.id === vo.id &&
+        Math.abs(stretchedVoiceCache.speed - safeRate) < 0.002
+      ) {
+        return stretchedVoiceCache.audioBuffer;
+      }
+
+      const src = vo.audioBuffer;
+      const sr = src.sampleRate;
+      const chCount = Math.min(2, src.numberOfChannels || 1);
+      const stretchedChs = [];
+      for (let c = 0; c < chCount; c++) {
+        stretchedChs.push(wsolaTimeStretchChannel(src.getChannelData(c), sr, safeRate));
+      }
+      const outLen = stretchedChs[0].length;
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!webAudioCtx) webAudioCtx = new Ctx();
+      const outBuf = webAudioCtx.createBuffer(chCount, outLen, sr);
+      for (let c = 0; c < chCount; c++) outBuf.copyToChannel(stretchedChs[c], c);
+      stretchedVoiceCache = { id: vo.id, speed: safeRate, audioBuffer: outBuf };
+      return outBuf;
+    }
+
+    function prewarmStretchedVoiceBuffer(speed) {
+      try {
+        if (!state.voiceover?.audioBuffer || state.voiceover.duration > 180) return;
+        getOrBuildStretchedVoiceBuffer(speed);
+      } catch {}
+    }
+
     function stopWebAudioFallback() {
       try { if (webVoiceSrc) { webVoiceSrc.stop(); webVoiceSrc.disconnect(); } } catch {}
       try { if (webBgmSrc) { webBgmSrc.stop(); webBgmSrc.disconnect(); } } catch {}
@@ -4826,7 +6088,7 @@
       webBgmGain = null;
     }
 
-    function startWebAudioFallbackFrom(offsetSec, sessionId) {
+    function startWebAudioFallbackFrom(offsetSec, sessionId, useStretchedWsola = true) {
       if (sessionId !== playbackSessionId || !state.isPlaying) return;
       stopWebAudioFallback();
       const dur = getTotalDuration();
@@ -4836,48 +6098,80 @@
       try {
         const Ctx = window.AudioContext || window.webkitAudioContext;
         if (!webAudioCtx) webAudioCtx = new Ctx();
-        if (webAudioCtx.state === 'suspended') webAudioCtx.resume().catch(() => {});
 
-        activeAudioMode = 'webaudio';
-        webAudioStartCtxTime = webAudioCtx.currentTime;
-        webAudioStartOffset = clamped;
-        smoothClockSec = clamped;
-        lastTickPerf = performance.now();
+        const stretchedBuf = useStretchedWsola ? getOrBuildStretchedVoiceBuffer(rate) : null;
+        const usingWsola = !!stretchedBuf;
 
-        if (state.voiceover?.audioBuffer && clamped < state.voiceover.duration) {
-          webVoiceSrc = webAudioCtx.createBufferSource();
-          webVoiceSrc.buffer = state.voiceover.audioBuffer;
-          webVoiceSrc.playbackRate.value = rate;
-          webVoiceGain = webAudioCtx.createGain();
-          webVoiceGain.gain.value = state.isMuted ? 0 : state.voiceVolume;
-          webVoiceSrc.connect(webVoiceGain);
-          webVoiceGain.connect(webAudioCtx.destination);
-          webVoiceSrc.start(0, clamped);
-        }
+        const schedulePlayback = () => {
+          if (sessionId !== playbackSessionId || !state.isPlaying) return;
+          const startAt = webAudioCtx.currentTime + 0.012;
+          activeAudioMode = usingWsola ? 'webaudio_wsola' : 'webaudio';
+          webAudioStartCtxTime = startAt;
+          webAudioStartOffset = clamped;
+          smoothClockSec = clamped;
+          lastTickPerf = performance.now();
 
-        if (state.bgm?.audioBuffer && state.bgmVolume > 0 && !state.isMuted) {
-          webBgmSrc = webAudioCtx.createBufferSource();
-          webBgmSrc.buffer = state.bgm.audioBuffer;
-          webBgmSrc.loop = true;
-          webBgmSrc.playbackRate.value = rate;
-          webBgmGain = webAudioCtx.createGain();
-          webBgmGain.gain.value = state.bgmVolume;
-          webBgmSrc.connect(webBgmGain);
-          webBgmGain.connect(webAudioCtx.destination);
-          const bgmOffset = state.bgm.duration > 0 ? (clamped % state.bgm.duration) : 0;
-          webBgmSrc.start(0, bgmOffset);
+          if (state.voiceover?.audioBuffer && clamped < state.voiceover.duration) {
+            webVoiceSrc = webAudioCtx.createBufferSource();
+            if (usingWsola) {
+              webVoiceSrc.buffer = stretchedBuf;
+              webVoiceSrc.playbackRate.value = 1.0;
+            } else {
+              webVoiceSrc.buffer = state.voiceover.audioBuffer;
+              webVoiceSrc.playbackRate.value = rate;
+            }
+            webVoiceGain = webAudioCtx.createGain();
+            webVoiceGain.gain.value = state.isMuted ? 0 : state.voiceVolume;
+            webVoiceSrc.connect(webVoiceGain);
+            webVoiceGain.connect(webAudioCtx.destination);
+            const bufOffset = usingWsola ? Math.max(0, Math.min(stretchedBuf.duration - 0.01, clamped / rate)) : clamped;
+            webVoiceSrc.start(startAt, bufOffset);
+          }
+
+          if (state.bgm?.audioBuffer && state.bgmVolume > 0 && !state.isMuted) {
+            webBgmSrc = webAudioCtx.createBufferSource();
+            webBgmSrc.buffer = state.bgm.audioBuffer;
+            webBgmSrc.loop = true;
+            webBgmSrc.playbackRate.value = rate;
+            webBgmGain = webAudioCtx.createGain();
+            webBgmGain.gain.value = state.bgmVolume;
+            webBgmSrc.connect(webBgmGain);
+            webBgmGain.connect(webAudioCtx.destination);
+            const bgmOffset = state.bgm.duration > 0 ? (clamped % state.bgm.duration) : 0;
+            webBgmSrc.start(startAt, bgmOffset);
+          }
+        };
+
+        if (webAudioCtx.state === 'suspended') {
+          activeAudioMode = 'webaudio_pending';
+          webAudioStartOffset = clamped;
+          smoothClockSec = clamped;
+          fallbackCheckTimer = setTimeout(() => {
+            if (sessionId === playbackSessionId && state.isPlaying && activeAudioMode === 'webaudio_pending') {
+              startHtmlAudioEngineFrom(clamped, sessionId);
+            }
+          }, 450);
+          webAudioCtx.resume().then(() => {
+            if (fallbackCheckTimer) { clearTimeout(fallbackCheckTimer); fallbackCheckTimer = null; }
+            schedulePlayback();
+          }).catch(() => {
+            if (fallbackCheckTimer) { clearTimeout(fallbackCheckTimer); fallbackCheckTimer = null; }
+            if (sessionId === playbackSessionId && state.isPlaying) {
+              startHtmlAudioEngineFrom(clamped, sessionId);
+            }
+          });
+        } else {
+          schedulePlayback();
         }
       } catch (err) {
-        console.warn('Web Audio fallback error:', err);
+        console.warn('Web Audio engine error, falling back to HTML audio:', err);
+        startHtmlAudioEngineFrom(clamped, sessionId);
       }
     }
 
-    function startAudioEngineFrom(offsetSec) {
-      playbackSessionId++;
-      const sessionId = playbackSessionId;
-      if (fallbackCheckTimer) clearTimeout(fallbackCheckTimer);
+    function startHtmlAudioEngineFrom(offsetSec, sessionId) {
+      if (sessionId !== playbackSessionId || !state.isPlaying) return;
       stopWebAudioFallback();
-
       const rate = state.playbackSpeed || 1.15;
       const dur = getTotalDuration();
       const clamped = Math.max(0, Math.min(dur, offsetSec));
@@ -4917,7 +6211,7 @@
             smoothClockSec = curA;
           }).catch(() => {
             if (sessionId === playbackSessionId && state.isPlaying) {
-              startWebAudioFallbackFrom(clamped, sessionId);
+              startWebAudioFallbackFrom(clamped, sessionId, false);
             }
           });
         }
@@ -4927,7 +6221,7 @@
           const stuck = el.voiceAudioEl.paused || !!el.voiceAudioEl.error || (el.voiceAudioEl.readyState < 2 && Math.abs(el.voiceAudioEl.currentTime - clamped) < 0.005);
           if (stuck) {
             try { el.voiceAudioEl.pause(); } catch {}
-            startWebAudioFallbackFrom(state.currentTime, sessionId);
+            startWebAudioFallbackFrom(state.currentTime, sessionId, false);
           }
         }, 900);
       } else {
@@ -4951,14 +6245,51 @@
       }
     }
 
+    function startAudioEngineFrom(offsetSec) {
+      playbackSessionId++;
+      const sessionId = playbackSessionId;
+      if (fallbackCheckTimer) clearTimeout(fallbackCheckTimer);
+      stopWebAudioFallback();
+      try { el.voiceAudioEl.pause(); } catch {}
+      try { el.bgmAudioEl.pause(); } catch {}
+
+      const rate = state.playbackSpeed || 1.15;
+      const dur = getTotalDuration();
+      const clamped = Math.max(0, Math.min(dur, offsetSec));
+
+      // Prefer pitch-preserved WSOLA Web Audio + hardware outputTimestamp lock (matches MP4 export bit-for-bit!)
+      if (state.voiceover?.audioBuffer && state.voiceover.duration <= 240 && clamped < state.voiceover.duration) {
+        startWebAudioFallbackFrom(clamped, sessionId, true);
+        return;
+      }
+      startHtmlAudioEngineFrom(clamped, sessionId);
+    }
+
     function getLivePlaybackTime(now = performance.now()) {
       if (!state.isPlaying) return state.currentTime;
       const rate = state.playbackSpeed || 1.15;
       const prevTickPerf = lastTickPerf;
       lastTickPerf = now;
 
-      if (activeAudioMode === 'webaudio' && webAudioCtx) {
-        const elapsed = Math.max(0, webAudioCtx.currentTime - webAudioStartCtxTime);
+      if (activeAudioMode === 'webaudio_pending') {
+        return webAudioStartOffset;
+      }
+
+      if ((activeAudioMode === 'webaudio_wsola' || activeAudioMode === 'webaudio') && webAudioCtx) {
+        let speakerCtxT = null;
+        if (typeof webAudioCtx.getOutputTimestamp === 'function') {
+          const ts = webAudioCtx.getOutputTimestamp();
+          if (ts && Number.isFinite(ts.contextTime) && Number.isFinite(ts.performanceTime) && ts.contextTime > 0 && ts.performanceTime > 0) {
+            speakerCtxT = ts.contextTime + (now - ts.performanceTime) / 1000;
+          }
+        }
+        if (speakerCtxT === null) {
+          const lat = (Number.isFinite(webAudioCtx.outputLatency) && webAudioCtx.outputLatency > 0)
+            ? webAudioCtx.outputLatency
+            : (Number.isFinite(webAudioCtx.baseLatency) ? webAudioCtx.baseLatency : 0.025);
+          speakerCtxT = webAudioCtx.currentTime - lat;
+        }
+        const elapsed = Math.max(0, speakerCtxT - webAudioStartCtxTime);
         smoothClockSec = webAudioStartOffset + elapsed * rate;
         return smoothClockSec;
       }
@@ -4975,10 +6306,6 @@
         if (!el.voiceAudioEl.paused && !el.voiceAudioEl.seeking && el.voiceAudioEl.readyState >= 2) {
           const audioT = el.voiceAudioEl.currentTime;
           if (Number.isFinite(audioT)) {
-            // The <audio> clock only ticks every ~10-100ms, so reading it raw makes captions/cuts step and trail.
-            // Instead the clock free-runs at the playback rate between ticks and is gently locked to the audio:
-            //  - audio can never be behind real time, so if it is ahead we jump up to it
-            //  - audio ticks lag by up to one step, so if we are ahead we only ease back a little
             const fresh = Math.abs(audioT - lastAudioClockVal) > 0.0005;
             if (fresh) {
               lastAudioClockVal = audioT;
@@ -4990,11 +6317,14 @@
             let c = smoothClockSec;
             if (audioIsLive && sampleAge < 0.25) c += frameDt * rate;
             if (fresh) {
-              const drift = audioT - c;
-              if (drift > 0 || drift < -0.25) c = audioT;
-              else c += drift * 0.08;
+              const estLat = (webAudioCtx && Number.isFinite(webAudioCtx.outputLatency) && webAudioCtx.outputLatency > 0)
+                ? webAudioCtx.outputLatency
+                : 0.032;
+              const targetT = Math.max(0, audioT - estLat * rate);
+              const drift = targetT - c;
+              if (Math.abs(drift) > 0.14) c = targetT;
+              else c += drift * 0.22;
             }
-            c = Math.min(c, audioT + 0.15 * rate);
             smoothClockSec = c;
             return Math.max(0, Math.min(state.voiceover.duration, smoothClockSec));
           }
@@ -5927,7 +7257,10 @@
       if (newWords.length === cap.words.length) {
         for (let i = 0; i < newWords.length; i++) cap.words[i].text = newWords[i];
       } else {
-        cap.words = distributeWordsByWeight(newWords, cap.start, cap.end);
+        const features = getVoiceAcousticFeatures();
+        cap.words = features
+          ? alignWordsToAcousticEnvelopeDP(newWords, cap.start, cap.end, features)
+          : distributeWordsByWeight(newWords, cap.start, cap.end);
       }
       state.captionsManuallyEdited = true;
       state.captionLayoutCache.clear();
@@ -6055,6 +7388,7 @@
 
       state.images = [];
       state.voiceover = null;
+      invalidateStretchedVoiceCache();
       state.bgm = null;
       state.speechSegments = [];
       state.rawWhisperWords = [];
@@ -6565,8 +7899,8 @@
       applyPitchPreservation(el.bgmAudioEl, state.playbackSpeed);
       if (state.isPlaying) {
         const curT = getLivePlaybackTime();
-        if (activeAudioMode === 'webaudio') {
-          startWebAudioFallbackFrom(curT, playbackSessionId);
+        if (activeAudioMode === 'webaudio' || activeAudioMode === 'webaudio_wsola' || activeAudioMode === 'webaudio_pending') {
+          startAudioEngineFrom(curT);
         } else {
           playAnchorMediaTime = curT;
           playAnchorPerfTime = performance.now();
@@ -6575,6 +7909,8 @@
           lastAudioClockVal = curT;
           lastAudioClockPerf = playAnchorPerfTime;
         }
+      } else {
+        setTimeout(() => prewarmStretchedVoiceBuffer(state.playbackSpeed), 20);
       }
       scheduleSaveProject();
     });
